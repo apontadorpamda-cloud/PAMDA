@@ -1,0 +1,2611 @@
+// pages/ApontamentoTratamento.js
+// Padrão PAMDA — Base44 + Supabase
+// Atualizações desta entrega:
+// - E1..X2: "00:00" não exibe (vazio) *quando* exibir_zeros_vazios = true
+// - Ajuste = Férias: rótulo "FÉRIAS" em E1/S1/E2/S2 quando não há marcações; cor ROSA
+// - Cores do Ajuste mais intensas (Folga=verde, Feriado=azul, Falta=vermelho, Atestado/Abono=amarelo, Férias=rosa)
+// - Hora Bônus: 2 marcações + trabalhado >= total_jornada => +1h extra (HE 50% ou 100% se Folga/Feriado)
+// - Mantidas as regras anteriores (HE/Int 100% em Folga/Feriado, totais zero → vazio, menu mover marcações)
+// - [NOVO] Chip “Hora bônus” agora na mesma cor dos demais chips (cinza).
+// - [NOVO] Zeros vazios na “Jornada Cumprida” respeitam exibir_zeros_vazios.
+// - [NOVO] Tolerância: aplica somente quando resultado > tolerância (antes era >=).
+// - [NOVO] Vr not 50% e Vr not 100% calculadas apenas no bloco DIURNO, usando condições hs_vr_not_50 / hs_vr_not_100.
+// - [NOVO] Limite de movimentação das marcações entre E1 e X2, com proteção das vizinhas (swap apenas).
+// - [NOVO] Largura da coluna Ajuste levemente reduzida e Dia/Hr reduzida para metade.
+// - [NOVO] Horas extras diurnas limitadas até cond.periodo_diurno_fim (ou campo equivalente da condição Diurno (final)).
+
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { base44 } from "@/api/base44Client";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
+import { Table, TableHead, TableHeader, TableBody, TableRow, TableCell } from "@/components/ui/table";
+import { toast } from "@/components/ui/use-toast";
+
+/* =========================
+   Supabase helpers (Padrão PAMDA)
+========================= */
+async function getSupabaseCfg() {
+  const cfg = await base44.entities.ConfigIntegracao.list();
+  if (!cfg || cfg.length === 0) throw new Error("Configuração do Supabase não encontrada.");
+  return { url: cfg[0].supabase_url.replace(/\/$/, ""), key: cfg[0].supabase_key };
+}
+async function sbGet(path) {
+  const { url, key } = await getSupabaseCfg();
+  const res = await fetch(`${url}${path}`, { headers: { apikey: key, Authorization: `Bearer ${key}` } });
+  if (!res.ok) throw new Error(await res.text());
+  return await res.json();
+}
+async function sbGetMaybe(path) {
+  try { return await sbGet(path); }
+  catch (e) {
+    const msg = String(e?.message || e);
+    if (msg.includes("PGRST205") || msg.includes("42P01") || msg.includes("42703")) {
+      console.warn("[PAMDA] Fonte/coluna opcional ausente:", path, e);
+      return null;
+    }
+    throw e;
+  }
+}
+async function sbPost(path, body, opts = {}) {
+  const { url, key } = await getSupabaseCfg();
+  const headers = {
+    apikey: key,
+    Authorization: `Bearer ${key}`,
+    "Content-Type": "application/json",
+    Prefer: opts.prefer || "return=representation",
+  };
+  const res = await fetch(`${url}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(await res.text());
+  return await res.json();
+}
+
+/* =========================
+   Utils
+========================= */
+const pad2 = (n) => String(n).padStart(2, "0");
+/**
+ * Normalize various time inputs into the `HH:MM` format.
+ *
+ * This helper accepts several user entry patterns:
+ * - One or two digits (e.g. "6" or "13"): interpreted as whole hours (06:00 or 13:00)
+ * - Three digits (e.g. "830"): interpreted as H:MM (8:30)
+ * - Four digits (e.g. "1230"): interpreted as HH:MM (12:30)
+ * - Already formatted strings like "06:00" remain unchanged via the fallback branch below.
+ *
+ * Any non‑digit characters are stripped before interpretation. The minutes portion
+ * is padded/clamped using pad2, but does not perform strict minute range checks
+ * (invalid minutes will still be padded). Inputs that cannot be parsed will
+ * return an empty string.
+ */
+function normalizeTime(hhmm) {
+  if (!hhmm) return "";
+  // Strip any non‑digit characters for numeric parsing
+  const d = String(hhmm).replace(/\D/g, "");
+  if (!d) return "";
+  let hh = "";
+  let mm = "";
+  if (d.length <= 2) {
+    // 1 or 2 digit hour, assume 00 minutes
+    hh = d;
+    mm = "00";
+  } else if (d.length === 3) {
+    // 3 digits: first digit hour, last two minutes
+    hh = d.slice(0, 1);
+    mm = d.slice(1, 3);
+  } else {
+    // 4 or more digits: first two hours, next two minutes
+    hh = d.slice(0, 2);
+    mm = d.slice(2, 4);
+  }
+  return `${pad2(+hh)}:${pad2(+mm)}`;
+}
+function combineToTz(dateISO, hhmm) {
+  if (!hhmm) return null;
+  return `${dateISO}T${hhmm}:00`;
+}
+
+/**
+ * Convert a time string into minutes. Accepts both `HH:MM` and compact numeric
+ * formats (e.g. "6" → 360, "830" → 510, "1230" → 750). If the string
+ * cannot be interpreted as a valid time, returns 0.
+ */
+function hhmmToMinutes(s) {
+  if (!s) return 0;
+  const str = String(s).trim();
+  // If the value contains a colon, parse as HH:MM
+  if (/^\d{1,2}:[0-5]\d$/.test(str)) {
+    const parts = str.split(":");
+    const h = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
+    return (isNaN(h) || isNaN(m)) ? 0 : h * 60 + m;
+  }
+  // Remove non‑digit characters and attempt to parse numeric forms
+  const d = str.replace(/\D/g, "");
+  if (!d) return 0;
+  let hh = "";
+  let mm = "";
+  if (d.length <= 2) {
+    hh = d;
+    mm = "00";
+  } else if (d.length === 3) {
+    hh = d.slice(0, 1);
+    mm = d.slice(1, 3);
+  } else {
+    hh = d.slice(0, 2);
+    mm = d.slice(2, 4);
+  }
+  const hNum = parseInt(hh, 10);
+  const mNum = parseInt(mm, 10);
+  if (isNaN(hNum) || isNaN(mNum)) return 0;
+  return hNum * 60 + mNum;
+}
+function minutesToHHMM(min) {
+  const m = Math.max(0, min|0);
+  const hh = Math.floor(m / 60);
+  const mm = m % 60;
+  return `${pad2(hh)}:${pad2(mm)}`;
+}
+
+// Paleta PAMDA
+const GRADIENT = "linear-gradient(135deg, #2B6CB0, #4A90E2)";
+const BG_CUMPRIDA = "#F3F7FE";
+const BG_AJUSTE   = "#F9FBFF";
+const BG_DIURNO   = "#F6FAFF";
+const BG_NOTURNO  = "#F4F8FF";
+const BG_DESC     = "#F7FAFF";
+const SEP_COLOR   = "#2B6CB0";
+
+// Medidas visuais (compactadas)
+const SEP_WIDTH_CM   = "0.10cm";
+const HEAD_ROW_H     = "10px";
+const SUBHEAD_ROW_H  = "10px";
+const HEAD_PAD_Y     = "0px";
+const SUBHEAD_PAD_Y  = "0px";
+
+// Ajustes de largura solicitados
+const AJUSTE_WIDTH_CM = "1.3cm";   // ligeiramente menor
+const DIAHR_WIDTH_CM  = "0.55cm";  // aproximadamente metade
+
+// Estilo de célula HH:MM compacta
+const hhmmCellStyle = { width: "1cm", paddingLeft: "0.08cm", paddingRight: "0.08cm" };
+
+/* =========================
+   Chaves de cálculo
+========================= */
+const DIURNO_KEYS  = ["d_he50","d_int50","d_he100","d_int100","d_folga","d_feriado","d_vr50","d_vr100"];
+const NOTURNO_KEYS = ["n_he50","n_int50","n_he100","n_int100","n_folga","n_feriado","n_adnot","n_hnred"];
+const DESC_KEYS    = ["desc_falta","desc_atraso","desc_saida"];
+const MARK_KEYS    = ["jc_e1","jc_s1","jc_e2","jc_s2","jc_x1","jc_x2"]; // ordem para mover
+
+/* =========================
+   Helpers de virada noturna
+========================= */
+const MIN_PER_DAY = 1440;
+
+function lastExitMinutes(row) {
+  // Última batida relevante do dia (ordem de prioridade)
+  const order = ["jc_x2","jc_s2","jc_x1","jc_s1","jc_e2","jc_e1"];
+  for (const k of order) {
+    if (row && row[k]) {
+      const m = hhmmToMinutes(row[k]);
+      if (m > 0) return m;
+    }
+  }
+  return 0;
+}
+
+function firstEntryMinutes(row) {
+  if (!row || !row.jc_e1) return 0;
+  return hhmmToMinutes(row.jc_e1);
+}
+
+/**
+ * Restante de descanso entre último dia anterior (lastPrevMin)
+ * e primeiro horário do dia atual (firstCurrMin),
+ * considerando "daysBetween" dias completos entre as datas.
+ */
+function restMinutesBetween(lastPrevMin, firstCurrMin, daysBetween) {
+  if (!lastPrevMin || !firstCurrMin || !daysBetween) return 0;
+  return daysBetween * MIN_PER_DAY - lastPrevMin + firstCurrMin;
+}
+
+function toLocalHM(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  const hh = d.getHours().toString().padStart(2, "0");
+  const mm = d.getMinutes().toString().padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+/* =========================
+   Componente principal
+========================= */
+export default function ApontamentoTratamento() {
+  // filtros
+  const [empresas, setEmpresas] = useState([]);
+  const [colabsAll, setColabsAll] = useState([]);
+  const [jornadas, setJornadas] = useState([]);
+  const [justificativas, setJustificativas] = useState([]);
+
+  const [empresaId, setEmpresaId] = useState("");
+  const [colabId, setColabId] = useState("");
+  const [periodoIni, setPeriodoIni] = useState("");
+  const [periodoFim, setPeriodoFim] = useState("");
+
+  // contadores
+  const [diasPeriodo, setDiasPeriodo] = useState(0);
+  const [rawNoPeriodo, setRawNoPeriodo] = useState(0);
+  const [diasComBatidas, setDiasComBatidas] = useState(0);
+
+  // grid
+  const [linhas, setLinhas] = useState([]);
+  const gridHasData = linhas.length > 0;
+  const colabsEmpresa = useMemo(
+    () => colabsAll.filter((c) => String(c.empresa_id) === String(empresaId)),
+    [colabsAll, empresaId]
+  );
+
+  // exibição de cálculos
+  const [mostrarCalculos, setMostrarCalculos] = useState(false);
+
+  // Condições p/ Cálculo
+  const [cond, setCond] = useState(null);
+  const [loadingCond, setLoadingCond] = useState(false);
+  const condReqToken = useRef(0);
+
+  // barras espelhadas
+  const tableScrollRef = useRef(null);
+  const topScrollRef = useRef(null);
+  const bottomScrollRef = useRef(null);
+  const spacerRef = useRef(null);
+
+  // menu de contexto (mover marcações)
+  const [ctxMenu, setCtxMenu] = useState({ show:false, x:0, y:0, rowIndex:null, key:null });
+
+  function syncSpacerWidth() {
+    const wrap = tableScrollRef.current;
+    const spacer = spacerRef.current;
+    if (!wrap || !spacer) return;
+    spacer.style.width = `${wrap.scrollWidth}px`;
+  }
+  const syncing = useRef(false);
+  function syncFrom(source) {
+    if (syncing.current) return;
+    syncing.current = true;
+    try {
+      const wrap = tableScrollRef.current;
+      const top = topScrollRef.current;
+      const bottom = bottomScrollRef.current;
+      if (!wrap || !top || !bottom) return;
+      if (source === "table") { top.scrollLeft = wrap.scrollLeft; bottom.scrollLeft = wrap.scrollLeft; }
+      else if (source === "top") { wrap.scrollLeft = top.scrollLeft; bottom.scrollLeft = top.scrollLeft; }
+      else if (source === "bottom") { wrap.scrollLeft = bottom.scrollLeft; top.scrollLeft = bottom.scrollLeft; }
+    } finally { syncing.current = false; }
+  }
+
+  useEffect(() => {
+    const ro = new ResizeObserver(syncSpacerWidth);
+    const wrap = tableScrollRef.current;
+    if (wrap) ro.observe(wrap);
+    return () => ro.disconnect();
+  }, []);
+  useEffect(() => {
+    syncSpacerWidth();
+    const t = setTimeout(syncSpacerWidth, 0);
+    return () => clearTimeout(t);
+  }, [linhas, mostrarCalculos]);
+
+  /* =========================
+     Carregar listas fixas
+  ========================== */
+  useEffect(() => {
+    (async () => {
+      try {
+        const [emp, cols, jds, justs] = await Promise.all([
+          sbGet(`/rest/v1/empresas?select=id,razao_social,cnpj&order=razao_social`),
+          sbGet(`/rest/v1/colaboradores?select=id,empresa_id,nome,pis,jornada,admissao,demissao&order=nome`),
+          sbGet(`/rest/v1/jornadas?select=id,descricao,e1,s1,e2,s2,inicio,fim&order=descricao`),
+          sbGet(`/rest/v1/justificativas?select=id,descricao&order=descricao`)
+        ]);
+        setEmpresas(emp || []); setColabsAll(cols || []); setJornadas(jds || []); setJustificativas(justs || []);
+      } catch (e) { console.error(e); }
+    })();
+  }, []);
+
+  /* =========================
+     Condições p/ Cálculo (empresa) com fallbacks
+  ========================== */
+  async function carregarCondicoesEmpresa(id) {
+    if (!id) { setCond(null); return; }
+    const myToken = ++condReqToken.current;
+    try {
+      setLoadingCond(true);
+
+      const ccRows = await sbGet(
+        `/rest/v1/condicoes_calculo?empresa_id=eq.${id}&select=*&order=vigente_desde.desc,updated_at.desc,created_at.desc&limit=1`
+      );
+      if (myToken !== condReqToken.current) return;
+      const cc = (Array.isArray(ccRows) && ccRows[0]) ? ccRows[0] : null;
+
+      const prefRows = await sbGetMaybe(
+        `/rest/v1/config_preferencias?empresa_id=eq.${id}&select=exibir_zeros_vazios,` +
+        `ancora_1750_0800,ancora_noturno_ini,ancora_noturno_fim,noturno_fixo,` +
+        `periodo_diurno_inicio,periodo_diurno_fim,` +
+        `tol_he_hhmm,tol_he_modo,tol_atraso_hhmm,tol_atraso_modo,` +
+        `jornada_minima_intervalo_hhmm,total_horas_por_jornada,hora_bonus&limit=1`
+      );
+      if (myToken !== condReqToken.current) return;
+      const pref = Array.isArray(prefRows) ? prefRows[0] : null;
+
+      const ciRows = await sbGetMaybe(
+        `/rest/v1/config_integracao?empresa_id=eq.${id}&select=ancora_1750_0800,ancora_noturno_ini,ancora_noturno_fim,noturno_fixo&limit=1`
+      );
+      if (myToken !== condReqToken.current) return;
+      const ci = Array.isArray(ciRows) ? ciRows[0] : null;
+
+      const merged = { ...(cc || {}) };
+
+      if (merged.exibir_zeros_vazios === undefined && pref?.exibir_zeros_vazios !== undefined) merged.exibir_zeros_vazios = pref.exibir_zeros_vazios;
+      if (!merged.tol_he_hhmm && pref?.tol_he_hhmm) { merged.tol_he_hhmm = pref.tol_he_hhmm; merged.tol_he_modo = pref.tol_he_modo ?? merged.tol_he_modo; }
+      if (!merged.tol_atraso_hhmm && pref?.tol_atraso_hhmm) { merged.tol_atraso_hhmm = pref.tol_atraso_hhmm; merged.tol_atraso_modo = pref.tol_atraso_modo ?? merged.tol_atraso_modo; }
+      if (!merged.jornada_minima_intervalo_hhmm && pref?.jornada_minima_intervalo_hhmm) merged.jornada_minima_intervalo_hhmm = pref.jornada_minima_intervalo_hhmm;
+      if (!merged.total_horas_por_jornada && pref?.total_horas_por_jornada) merged.total_horas_por_jornada = pref.total_horas_por_jornada;
+      if (merged.hora_bonus === undefined && pref?.hora_bonus !== undefined) merged.hora_bonus = pref.hora_bonus;
+      if (!merged.periodo_diurno_inicio && pref?.periodo_diurno_inicio) merged.periodo_diurno_inicio = pref.periodo_diurno_inicio;
+      if (!merged.periodo_diurno_fim && pref?.periodo_diurno_fim) merged.periodo_diurno_fim = pref.periodo_diurno_fim;
+
+      const hasAnchCC   = merged.ancora_noturno_ini || merged.ancora_noturno_fim;
+      const hasAnchPref = pref?.ancora_noturno_ini || pref?.ancora_noturno_fim;
+      const hasAnchCI   = ci?.ancora_noturno_ini || ci?.ancora_noturno_fim;
+
+      if (!hasAnchCC && hasAnchPref) {
+        merged.ancora_noturno_ini = pref.ancora_noturno_ini;
+        merged.ancora_noturno_fim = pref.ancora_noturno_fim;
+        if (pref?.noturno_fixo !== undefined) merged.noturno_fixo = pref.noturno_fixo;
+      }
+      if (!merged.ancora_noturno_ini && !merged.ancora_noturno_fim && hasAnchCI) {
+        merged.ancora_noturno_ini = ci.ancora_noturno_ini;
+        merged.ancora_noturno_fim = ci.ancora_noturno_fim;
+        if (ci?.noturno_fixo !== undefined) merged.noturno_fixo = ci.noturno_fixo;
+      }
+
+      const anchorFlag = (pref?.ancora_1750_0800 === true) || (ci?.ancora_1750_0800 === true) || (merged?.ancora_1750_0800 === true);
+      if (!merged.ancora_noturno_ini && !merged.ancora_noturno_fim && anchorFlag) {
+        merged.ancora_noturno_ini = "17:50";
+        merged.ancora_noturno_fim = "08:00";
+        merged.noturno_fixo = true;
+      }
+
+      setCond(merged && Object.keys(merged).length ? merged : null);
+    } catch (e) {
+      if (myToken !== condReqToken.current) return;
+      console.error(e);
+      setCond(null);
+    } finally {
+      if (myToken === condReqToken.current) setLoadingCond(false);
+    }
+  }
+  useEffect(() => { carregarCondicoesEmpresa(empresaId); }, [empresaId]);
+
+  /* =========================
+     Contadores (topo)
+  ========================== */
+  async function atualizarContadores() {
+    try {
+      if (!empresaId || !periodoIni || !periodoFim) {
+        setDiasPeriodo(0); setRawNoPeriodo(0); setDiasComBatidas(0); return;
+      }
+      const dt0 = new Date(periodoIni), dt1 = new Date(periodoFim);
+      let d = 0, aux = new Date(dt0);
+      while (aux <= dt1) { d++; aux.setDate(aux.getDate() + 1); }
+      setDiasPeriodo(d);
+
+      const raw = await sbGet(`/rest/v1/batidas_raw?empresa_id=eq.${empresaId}&data_hora=gte.${periodoIni}T00:00:00Z&data_hora=lte.${periodoFim}T23:59:59Z&select=id&limit=10000`);
+      setRawNoPeriodo(Array.isArray(raw) ? raw.length : 0);
+
+      if (colabId) {
+        const dias = await sbGet(`/rest/v1/batidas?colaborador_id=eq.${colabId}&data=gte.${periodoIni}&data=lte.${periodoFim}&select=data&limit=10000`);
+        const distinct = new Set(dias.map((r) => r.data));
+        setDiasComBatidas(distinct.size);
+      } else {
+        setDiasComBatidas(0);
+      }
+    } catch (e) { console.error(e); }
+  }
+  useEffect(() => { atualizarContadores(); }, [empresaId, colabId, periodoIni, periodoFim]);
+
+  /* =========================
+     Gerar período
+  ========================== */
+  function gerarPeriodo() {
+    if (!empresaId || !colabId || !periodoIni || !periodoFim) return;
+
+    const col = colabsAll.find((c) => c.id === colabId);
+    const jornadaBase = jornadas.find((j) => String(j.id) === String(col?.jornada)) || null;
+
+    const start = new Date(periodoIni + "T00:00:00");
+    const end   = new Date(periodoFim + "T00:00:00");
+
+    const arr = [];
+    const walk = new Date(start);
+    while (walk <= end) {
+      const dateISO = walk.toISOString().slice(0, 10);
+      const dd = pad2(walk.getDate());
+      arr.push({
+        dateISO, dd,
+        jSel: jornadaBase?.id || "",
+        jc_e1: "", jc_s1: "", jc_e2: "", jc_s2: "", jc_x1: "", jc_x2: "",
+        ajuste_id: "", grau_diahr: "",
+        ...Object.fromEntries([...DIURNO_KEYS, ...NOTURNO_KEYS, ...DESC_KEYS].map(k => [k, ""]))
+      });
+      walk.setDate(walk.getDate() + 1);
+    }
+    setLinhas(arr);
+    setMostrarCalculos(false);
+  }
+
+  function aplicarJornada(idx, jId) {
+    setLinhas((old) => old.map((row, i) => (i === idx ? { ...row, jSel: jId } : row)));
+  }
+
+ async function carregarCumprida() {
+  try {
+    if (!colabId || !periodoIni || !periodoFim) return;
+
+    const data = await sbGet(
+      `/rest/v1/vw_batidas_jornada` +
+      `?colaborador_id=eq.${colabId}` +
+      `&data=gte.${periodoIni}` +
+      `&data=lte.${periodoFim}` +
+      `&select=data,e1_hhmm,s1_hhmm,e2_hhmm,s2_hhmm,x1_hhmm,x2_hhmm` +
+      `&order=data`
+    );
+
+    const toHHMM = (v) => (v ?? "").toString().slice(0,5);
+
+    const map = new Map();
+    for (const r of (data || [])) {
+      map.set(r.data, r);
+    }
+
+    const novas = linhas.map((row) => {
+      const hit = map.get(row.dateISO);
+
+      return {
+        ...row,
+        jc_e1: hit ? toHHMM(hit.e1_hhmm) : "",
+        jc_s1: hit ? toHHMM(hit.s1_hhmm) : "",
+        jc_e2: hit ? toHHMM(hit.e2_hhmm) : "",
+        jc_s2: hit ? toHHMM(hit.s2_hhmm) : "",
+        jc_x1: hit ? toHHMM(hit.x1_hhmm) : "",
+        jc_x2: hit ? toHHMM(hit.x2_hhmm) : "",
+      };
+    });
+
+    setLinhas(novas);
+    setMostrarCalculos(true);
+    await atualizarContadores();
+    setTimeout(syncSpacerWidth, 0);
+
+  } catch (e) {
+    console.error(e);
+  }
+}
+/* =========================
+     Jornada CUMPRIDA (view local *_hhmm)
+  ========================== */
+  async function carregarCumprida() {
+    try {
+      if (!colabId || !periodoIni || !periodoFim) return;
+
+      const data = await sbGet(
+        `/rest/v1/vw_batidas_local` +
+        `?colaborador_id=eq.${colabId}` +
+        `&data=gte.${periodoIni}` +
+        `&data=lte.${periodoFim}` +
+        `&select=data,e1_hhmm,s1_hhmm,e2_hhmm,s2_hhmm,x1_hhmm,x2_hhmm` +
+        `&order=data`
+      );
+
+      const toHHMM = (v) => (v ?? "").toString().slice(0, 5);
+      const map = new Map();
+      for (const r of (data || [])) map.set(r.data, r);
+
+      setLinhas((old) =>
+        old.map((row) => {
+          const hit = map.get(row.dateISO);
+          if (!hit) return row;
+          return {
+            ...row,
+            jc_e1: toHHMM(hit.e1_hhmm),
+            jc_s1: toHHMM(hit.s1_hhmm),
+            jc_e2: toHHMM(hit.e2_hhmm),
+            jc_s2: toHHMM(hit.s2_hhmm),
+            jc_x1: toHHMM(hit.x1_hhmm),
+            jc_x2: toHHMM(hit.x2_hhmm),
+          };
+        })
+      );
+
+      setMostrarCalculos(true);
+      await atualizarContadores();
+      setTimeout(syncSpacerWidth, 0);
+    } catch (e) { console.error(e); }
+  }
+
+/* =========================
+     Ver Tratadas
+   ========================== */
+async function carregarTratadas() {
+  try {
+    if (!colabId || !periodoIni || !periodoFim) return;
+
+    const dados = await sbGet(
+      `/rest/v1/apuracoes` +
+      `?colaborador_id=eq.${colabId}` +
+      `&data=gte.${periodoIni}` +
+      `&data=lte.${periodoFim}` +
+      `&select=data,json_detalhado` +
+      `&order=data`
+    );
+
+    if (!dados || dados.length === 0) {
+      toast({
+        title: "Nenhum dado tratado",
+        description: "Não existe apuração salva para este período.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const map = new Map();
+    for (const r of dados) {
+      map.set(r.data, r.json_detalhado);
+    }
+
+    setLinhas((old) =>
+      old.map((row) => {
+        const info = map.get(row.dateISO);
+        if (!info) return row;
+
+        return {
+          ...row,
+          jc_e1: info.jc_e1 || "",
+          jc_s1: info.jc_s1 || "",
+          jc_e2: info.jc_e2 || "",
+          jc_s2: info.jc_s2 || "",
+          jc_x1: info.jc_x1 || "",
+          jc_x2: info.jc_x2 || "",
+
+          // totais
+          d_he50: info.d_he50 || "",
+          d_int50: info.d_int50 || "",
+          d_he100: info.d_he100 || "",
+          d_int100: info.d_int100 || "",
+          n_he50: info.n_he50 || "",
+          n_int50: info.n_int50 || "",
+          n_he100: info.n_he100 || "",
+          n_int100: info.n_int100 || "",
+          ad_not: info.ad_not || "",
+          h_not_red: info.h_not_red || "",
+          folga_d: info.folga_d || "",
+          feriado_d: info.feriado_d || "",
+          folga_n: info.folga_n || "",
+          feriado_n: info.feriado_n || "",
+          desc_falta: info.desc_falta || "",
+          desc_saida: info.desc_saida || "",
+          desc_atraso: info.desc_atraso || "",
+        };
+      })
+    );
+
+    toast({
+      title: "Tratadas carregadas",
+      description: "As apurações foram carregadas com sucesso.",
+    });
+
+    setMostrarCalculos(true);
+    setTimeout(syncSpacerWidth, 0);
+
+  } catch (e) {
+    console.error(e);
+    toast({
+      title: "Erro ao carregar tratadas",
+      description: "Não foi possível carregar os dados.",
+      variant: "destructive",
+    });
+  }
+}
+
+async function salvarTudo() {
+  try {
+    if (!colabId || !empresaId || !periodoIni || !periodoFim) {
+      toast({
+        title: "Dados incompletos",
+        description: "Selecione empresa, colaborador e período.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const toInterval = (v) => {
+      if (!v || v === "" || v === "00:00") return null;
+      return v; // Postgres aceita HH:MI
+    };
+
+    const gerarDiasPeriodo = (inicio, fim) => {
+      const dias = [];
+      let d = new Date(inicio + "T00:00:00");
+      const end = new Date(fim + "T00:00:00");
+
+      while (d <= end) {
+        dias.push(d.toISOString().slice(0, 10));
+        d.setDate(d.getDate() + 1);
+      }
+      return dias;
+    };
+
+    const agora = new Date().toISOString();
+    const competencia = `${periodoIni.slice(0, 7)}-01`;
+
+    // Indexa as linhas existentes (com batidas)
+    const mapLinhas = new Map();
+    for (const r of linhas || []) {
+      if (r?.dateISO) mapLinhas.set(r.dateISO, r);
+    }
+
+    const diasPeriodo = gerarDiasPeriodo(periodoIni, periodoFim);
+    const rows = [];
+
+    for (const dataISO of diasPeriodo) {
+      const r = mapLinhas.get(dataISO) || {};
+
+      // --- ABONO / TEXTO ---
+      let abono = null;
+      if (r.tipo_dia === "FOLGA") abono = "FOLGA";
+      else if (r.tipo_dia === "FERIADO") abono = "FERIADO";
+      else if (r.tipo_dia === "FALTA") abono = "FALTA";
+      else if (r.justificativa) abono = r.justificativa;
+
+      const payload = {
+        colaborador_id: colabId,
+        empresa_id: empresaId,
+        data: dataISO,
+        competencia,
+        gerada_em: agora,
+        atualizado_em: agora,
+        status: "GERADA",
+
+        // TEXTO
+        abono,
+
+        // DIURNO
+        he50_d: toInterval(r.d_he50),
+        int50_d: toInterval(r.d_int50),
+        he100_d: toInterval(r.d_he100),
+        int100_d: toInterval(r.d_int100),
+        folga_d: toInterval(r.d_folga),
+        feriado_d: toInterval(r.d_feriado),
+        vr_not_50_d: toInterval(r.d_vr_not_50),
+        vr_not_100_d: toInterval(r.d_vr_not_100),
+        faltas_d: toInterval(r.d_faltas),
+        atrasos_d: toInterval(r.d_atrasos),
+        saida_antecipada_d: toInterval(r.desc_saida),
+
+        // NOTURNO
+        he50_n: toInterval(r.n_he50),
+        int50_n: toInterval(r.n_int50),
+        he100_n: toInterval(r.n_he100),
+        int100_n: toInterval(r.n_int100),
+        folga_n: toInterval(r.n_folga),
+        feriado_n: toInterval(r.n_feriado),
+        ad_not_n: toInterval(r.n_ad_not),
+        h_not_red_n: toInterval(r.n_h_not_red),
+
+        // GUARDA TUDO (com ou sem batida)
+        json_detalhado: r || {},
+      };
+
+      rows.push(payload);
+    }
+
+    await sbPost(
+      `/rest/v1/apuracoes?on_conflict=colaborador_id,data`,
+      rows,
+      { prefer: "resolution=merge-duplicates,return=representation" }
+    );
+
+    toast({
+      title: "Apuração salva com sucesso",
+      description: "Todos os dias do período foram gravados, com ou sem marcações.",
+    });
+
+  } catch (e) {
+    console.error(e);
+    toast({
+      title: "Erro ao salvar apuração",
+      description: "Ocorreu um erro ao gravar os dados.",
+      variant: "destructive",
+    });
+  }
+}
+
+/* ============================================================
+     >>> PASSO 5 — REGRAS DIURNAS (implementação) + VR NOTURNAS <<<
+  ============================================================ */
+  function getCondParsed(c) {
+    // Período diurno: início e fim (sempre pelas condições novas)
+    const periodoDiurnoIniStr = c?.periodo_diurno_inicio || "";
+    const periodoDiurnoFimStr = c?.periodo_diurno_fim || "";
+
+    // Hora noturna reduzida (minutos). Pode vir como "mm:ss" (ex.: "07:30" = 7,5 minutos)
+    const rawHoraNoturnaReduzida =
+      c?.hora_noturna_reduzida_hhmm || c?.hora_noturna_reduzida || "";
+
+    let horaNoturnaReduzidaMin = 0;
+    if (rawHoraNoturnaReduzida) {
+      const parts = String(rawHoraNoturnaReduzida).split(":");
+      if (parts.length === 2) {
+        const m0 = parseInt(parts[0], 10);
+        const s0 = parseInt(parts[1], 10);
+        if (!isNaN(m0) && !isNaN(s0)) {
+          horaNoturnaReduzidaMin = m0 + s0 / 60;
+        }
+      } else {
+        const f = parseFloat(rawHoraNoturnaReduzida);
+        if (!isNaN(f) && f > 0) horaNoturnaReduzidaMin = f;
+      }
+    }
+
+    return {
+      exibirZerosVazios: Boolean(c?.exibir_zeros_vazios),
+
+      // Tolerâncias
+      tolHE: hhmmToMinutes(c?.tol_he_hhmm || "00:00"),
+      tolHEModo: (c?.tol_he_modo || "por_marcacao").toLowerCase(),
+      tolAtraso: hhmmToMinutes(c?.tol_atraso_hhmm || "00:00"),
+      tolAtrasoModo: (c?.tol_atraso_modo || "por_marcacao").toLowerCase(),
+
+      // Jornada / intervalo
+      jornadaMinIntervalo: hhmmToMinutes(
+        c?.jornada_minima_intervalo_hhmm || "00:00"
+      ),
+      totalHorasJornada: hhmmToMinutes(
+        c?.total_horas_por_jornada || "00:00"
+      ),
+
+      // Hora bônus
+      horaBonus: Boolean(c?.hora_bonus),
+
+      // Viradas noturnas (valores-alvo em minutos)
+      hsVrNot50Min: hhmmToMinutes(c?.hs_vr_not_50 || "00:00"),
+      hsVrNot100Min: hhmmToMinutes(c?.hs_vr_not_100 || "00:00"),
+
+      // Limites do período diurno (em minutos, usados na HE diurna)
+      periodoDiurnoIniMin: hhmmToMinutes(periodoDiurnoIniStr || "00:00"),
+      periodoDiurnoFimMin: hhmmToMinutes(periodoDiurnoFimStr || "00:00"),
+
+      // Redução noturna (minutos de redução por hora)
+      horaNoturnaReduzidaMin,
+    };
+  }
+
+  function getAjusteTipo(row) {
+    const j = justificativas.find(j => String(j.id) === String(row.ajuste_id));
+    const txt = String(j?.descricao || "").trim().toUpperCase();
+    const isFolga    = /(^FO$|FOLGA)/.test(txt);
+    const isFeriado  = /(^FE$|FERIADO)/.test(txt);
+    const isFerias   = /(FÉRIAS|FERIAS)/.test(txt);
+    const isFalta    = /(FALTA)/.test(txt);
+    const isAtestado = /(ATESTADO)/.test(txt);
+    const isAbono    = /(ABONO)/.test(txt);
+    return { isFolga, isFeriado, isFerias, isFalta, isAtestado, isAbono, label: txt };
+  }
+
+  function isFolgaOuFeriado(row) {
+    const { isFolga, isFeriado } = getAjusteTipo(row);
+    return isFolga || isFeriado;
+  }
+
+  function getAjusteStyle(row) {
+    const { isFolga, isFeriado, isFerias, isFalta, isAtestado, isAbono } = getAjusteTipo(row);
+    if (isFolga)    return { background: "#10B98133", borderColor: "#059669", outline: "2px solid #05966955" }; // verde + intenso
+    if (isFeriado)  return { background: "#3B82F633", borderColor: "#2563EB", outline: "2px solid #2563EB55" }; // azul + intenso
+    if (isFerias)   return { background: "#EC489933", borderColor: "#DB2777", outline: "2px solid #DB277755" }; // rosa + intenso
+    if (isFalta)    return { background: "#EF444433", borderColor: "#DC2626", outline: "2px solid #DC262655" }; // vermelho + intenso
+    if (isAtestado || isAbono) return { background: "#F59E0B33", borderColor: "#D97706", outline: "2px solid #D9770655" }; // amarelo + intenso
+    if (row.ajuste_id) return { background: "#E5E7EB", borderColor: "#9CA3AF" };
+    return { background: BG_AJUSTE };
+  }
+
+  const UMA_HORA = 60;
+
+  function workedMinutes(row) {
+    const mE1 = hhmmToMinutes(row.jc_e1), mS1 = hhmmToMinutes(row.jc_s1);
+    const mE2 = hhmmToMinutes(row.jc_e2), mS2 = hhmmToMinutes(row.jc_s2);
+    let w = 0;
+    if (mE1 && mS1) w += Math.max(0, mS1 - mE1);
+    if (mE2 && mS2) w += Math.max(0, mS2 - mE2);
+    return w;
+  }
+
+  // >>> NOVO: função auxiliar para saber se há, de fato, janela DIURNA
+  function haJanelaDiurna(mE1, mS1, mE2, mS2, diurnoIni, diurnoFim) {
+    // Se não tiver limites configurados, mantém comportamento antigo
+    if (!diurnoIni && !diurnoFim) return true;
+
+    const inicioTrabalho = mE1 || mE2 || 0;
+    const fimTrabalho = mS2 || mS1 || 0;
+    if (!inicioTrabalho || !fimTrabalho) return false;
+
+    const ini = diurnoIni || 0;
+    const fim = diurnoFim || (24 * 60);
+
+    const overlap = Math.min(fimTrabalho, fim) - Math.max(inicioTrabalho, ini);
+    return overlap > 0;
+  }
+
+  function getCumprirByJornada(row) {
+    const j = jornadas.find(x => String(x.id) === String(row.jSel));
+    return {
+      E1c: j?.e1 ? String(j.e1).slice(0,5) : "",
+      S1c: j?.s1 ? String(j.s1).slice(0,5) : "",
+      E2c: j?.e2 ? String(j.e2).slice(0,5) : "",
+      S2c: j?.s2 ? String(j.s2).slice(0,5) : "",
+    };
+  }
+
+ // >>> Ajuste: tolerância aplica somente quando > tol (antes era >=)
+ // >>> Ajuste: Horas extras DIURNAS limitadas até periodoDiurnoFimMin
+ function calcHE_Diurno(
+   mE1,
+   mS1,
+   mE2,
+   mS2,
+   mE1c,
+   mS1c,
+   mE2c,
+   mS2c,
+   tol,
+   modo,
+   periodoDiurnoIniMin,
+   periodoDiurnoFimMin
+ ) {
+   let adiant = 0;
+   let prorrog = 0;
+
+   // Entrada antecipada: conta só a partir do início do período diurno
+   if (mE1 && mE1c) {
+     const entradaReal = periodoDiurnoIniMin
+       ? Math.max(mE1, periodoDiurnoIniMin)
+       : mE1;
+     const entradaPlan = periodoDiurnoIniMin
+       ? Math.max(mE1c, periodoDiurnoIniMin)
+       : mE1c;
+     adiant = Math.max(0, entradaPlan - entradaReal);
+   }
+
+   // Saída prorrogada: conta só até o fim do período diurno
+   const saidaRealBruta = mS2 || mS1 || 0;
+   const saidaPlanBruta = mS2c || mS1c || 0;
+
+   if (saidaRealBruta && saidaPlanBruta) {
+     const saidaReal = periodoDiurnoFimMin
+       ? Math.min(saidaRealBruta, periodoDiurnoFimMin)
+       : saidaRealBruta;
+     const saidaPlan = periodoDiurnoFimMin
+       ? Math.min(saidaPlanBruta, periodoDiurnoFimMin)
+       : saidaPlanBruta;
+     prorrog = Math.max(0, saidaReal - saidaPlan);
+   }
+
+   // Aplicação da tolerância
+   if (modo === "por_dia") {
+     const bruto = adiant + prorrog;
+     if (bruto <= tol) return 0;
+     return bruto - tol;
+   }
+
+   const seg1 = adiant > tol ? adiant : 0;
+   const seg2 = prorrog > tol ? prorrog : 0;
+   return seg1 + seg2;
+ }
+
+ function calcInt_Diurno(mE1, mS1, mE2, mS2, jornadaMinIntervalo, tol, modo) {
+     if (mE1 && mS1 && mE2 && mS2) {
+       const real = Math.max(0, mE2 - mS1);
+       if (real >= UMA_HORA) return 0;
+       const faltante = UMA_HORA - real;
+       if (modo === "por_dia") return Math.max(0, faltante - tol);
+       return faltante > tol ? faltante : 0;
+     }
+     if (mE1 && mS1) {
+       const jc = Math.max(0, mS1 - mE1);
+       if (jc >= jornadaMinIntervalo) {
+         if (modo === "por_dia") return Math.max(0, UMA_HORA - tol);
+         return UMA_HORA > tol ? UMA_HORA : 0;
+       }
+     }
+     return 0;
+   }
+
+   function isNoPunches(row) {
+     return !(row.jc_e1 || row.jc_s1 || row.jc_e2 || row.jc_s2 || row.jc_x1 || row.jc_x2);
+   }
+   function countPunches(row) {
+     return ["jc_e1","jc_s1","jc_e2","jc_s2","jc_x1","jc_x2"].reduce((n,k)=>n + (row[k] ? 1 : 0), 0);
+   }
+
+   // Estilo/colorização dos campos de marcação quando Folga/Feriado/Férias (somente E1..S2)
+   function getCumpridaCellStyle(row, key) {
+     if (!["jc_e1","jc_s1","jc_e2","jc_s2"].includes(key)) return {};
+     const { isFolga, isFeriado, isFerias } = getAjusteTipo(row);
+     if (isNoPunches(row) && (isFolga || isFeriado || isFerias)) {
+       if (isFolga)   return { background: "#10B98122", color: "#065F46", fontWeight: 600 };
+       if (isFeriado) return { background: "#3B82F622", color: "#1E3A8A", fontWeight: 600 };
+       if (isFerias)  return { background: "#EC489922", color: "#9D174D", fontWeight: 600 };
+     }
+     return {};
+   }
+
+   // >>> Ajuste: zeros vazios na Jornada Cumprida dependem de exibir_zeros_vazios
+   function getCumpridaDisplay(row, key) {
+     const v = (row[key] || "").trim();
+     const asZero = v === "00:00" || v === "0:00";
+     const { isFolga, isFeriado, isFerias, isFalta } = getAjusteTipo(row);
+
+     if (isNoPunches(row)) {
+       if (["jc_e1","jc_s1","jc_e2","jc_s2"].includes(key)) {
+         if (isFolga)   return "FOLGA";
+         if (isFeriado) return "FERIADO";
+         if (isFerias)  return "FÉRIAS";
+         if (isFalta)   return "FALTA";
+       }
+       if (["jc_x1","jc_x2"].includes(key)) return "";
+     }
+     // só esconde "00:00" quando a preferência exibir_zeros_vazios estiver ativa
+     return (asZero && cond?.exibir_zeros_vazios) ? "" : v;
+   }
+
+   function isCumpridaReadOnly(row) {
+     const { isFolga, isFeriado, isFerias, isFalta } = getAjusteTipo(row);
+     return isNoPunches(row) && (isFolga || isFeriado || isFerias || isFalta);
+   }
+
+   /**
+    * Cálculos diurnos por linha, incluindo:
+    * - HE 50/100
+    * - Intervalo 50/100
+    * - Folga / Feriado
+    * - Vr not 50% / Vr not 100% (somente no bloco DIURNO)
+    */
+   function calcDiurnoLinha(row, cParsed, idx, arr) {
+     const { E1c, S1c, E2c, S2c } = getCumprirByJornada(row);
+
+     const mE1 = hhmmToMinutes(row.jc_e1),
+       mS1 = hhmmToMinutes(row.jc_s1);
+     const mE2 = hhmmToMinutes(row.jc_e2),
+       mS2 = hhmmToMinutes(row.jc_s2);
+
+     const mE1c = hhmmToMinutes(E1c),
+       mS1c = hhmmToMinutes(S1c);
+     const mE2c = hhmmToMinutes(E2c),
+       mS2c = hhmmToMinutes(S2c);
+
+     const { isFolga, isFeriado } = getAjusteTipo(row);
+
+     // HE 50% base, já respeitando período diurno e tolerância
+     let he50_obs = calcHE_Diurno(
+       mE1,
+       mS1,
+       mE2,
+       mS2,
+       mE1c,
+       mS1c,
+       mE2c,
+       mS2c,
+       cParsed.tolHE,
+       cParsed.tolHEModo,
+       cParsed.periodoDiurnoIniMin,
+       cParsed.periodoDiurnoFimMin
+     );
+
+     // Intervalo devido (60 min) vs realizado
+     const int50_obs = calcInt_Diurno(
+       mE1,
+       mS1,
+       mE2,
+       mS2,
+       cParsed.jornadaMinIntervalo,
+       cParsed.tolAtraso,
+       cParsed.tolAtrasoModo
+     );
+
+     const w = workedMinutes(row);
+
+     // Folga / Feriado convertidos em minutos
+     let d_folga_min = 0,
+       d_feriado_min = 0;
+     if (isFolga || isFeriado) {
+       const base =
+         w >= cParsed.totalHorasJornada && cParsed.totalHorasJornada > 0
+           ? cParsed.totalHorasJornada
+           : w;
+       if (isFolga) d_folga_min = base;
+       if (isFeriado) d_feriado_min = base;
+     }
+
+     // Hora bônus (aplicada sobre HE diurna)
+     let bonusMin = 0;
+     if (
+       cParsed.horaBonus &&
+       countPunches(row) === 2 &&
+       w >= cParsed.totalHorasJornada &&
+       cParsed.totalHorasJornada > 0
+     ) {
+       bonusMin = 60;
+     }
+
+     // 🔹 Cálculo de atraso + saída antecipada (para DESCONTAR da HE diurna)
+     let atrasoMin = 0;
+     if (mE1 && mE1c && mE1 > mE1c) {
+       atrasoMin = mE1 - mE1c;
+     }
+
+     const schedEnd = mS2c || mS1c || 0;
+     const lastExit = mS2 || mS1 || 0;
+     let saidaAntMin = 0;
+     if (lastExit > 0 && schedEnd > 0 && lastExit < schedEnd) {
+       saidaAntMin = schedEnd - lastExit;
+     }
+
+     const tolAtraso = cParsed.tolAtraso || 0;
+     if (atrasoMin > 0 && atrasoMin <= tolAtraso) atrasoMin = 0;
+     if (saidaAntMin > 0 && saidaAntMin <= tolAtraso) saidaAntMin = 0;
+
+     const descontoHE = atrasoMin + saidaAntMin;
+
+     // >>> NOVO: se NÃO houver janela diurna real, zera a HE diurna
+     const temDiurno = haJanelaDiurna(
+       mE1,
+       mS1,
+       mE2,
+       mS2,
+       cParsed.periodoDiurnoIniMin,
+       cParsed.periodoDiurnoFimMin
+     );
+     if (!temDiurno) {
+       he50_obs = 0;
+     }
+
+     // Distribuição entre H.E. 50% (D) / H.E. 100% (D) e intervalos
+     let d_he50 = "",
+       d_int50 = "",
+       d_he100 = "",
+       d_int100 = "";
+
+     if (isFolga || isFeriado) {
+       const he100_totalBruto = he50_obs + bonusMin;
+       const he100_liq_min = Math.max(0, he100_totalBruto - descontoHE);
+       const int100_total = int50_obs;
+
+       d_he100 = he100_liq_min > 0 ? minutesToHHMM(he100_liq_min) : "";
+       d_int100 = int100_total > 0 ? minutesToHHMM(int100_total) : "";
+     } else {
+       const he50_totalBruto = he50_obs + bonusMin;
+       const he50_liq_min = Math.max(0, he50_totalBruto - descontoHE);
+       const int50_total = int50_obs;
+
+       d_he50 = he50_liq_min > 0 ? minutesToHHMM(he50_liq_min) : "";
+       d_int50 = int50_total > 0 ? minutesToHHMM(int50_total) : "";
+     }
+
+     // VR NOT 50%: descanso menor que limite entre dia anterior e o atual
+     let d_vr50 = "";
+     if (cParsed.hsVrNot50Min > 0 && idx > 0) {
+       const prev = arr[idx - 1];
+       const lastPrevMin = lastExitMinutes(prev);
+       const firstCurrMin = firstEntryMinutes(row);
+       const restMin = restMinutesBetween(lastPrevMin, firstCurrMin, 1);
+       if (restMin > 0 && restMin < cParsed.hsVrNot50Min) {
+         const diff = cParsed.hsVrNot50Min - restMin;
+         d_vr50 = minutesToHHMM(diff);
+       }
+     }
+
+     // VR NOT 100%: descanso menor que limite entre D-2 e D, com folga/feriado em D-1
+     let d_vr100 = "";
+     if (cParsed.hsVrNot100Min > 0 && idx > 1) {
+       const diaAnterior = arr[idx - 1];
+       if (isFolgaOuFeriado(diaAnterior)) {
+         const penultimo = arr[idx - 2];
+         const lastPenultimoMin = lastExitMinutes(penultimo);
+         const firstCurrMin = firstEntryMinutes(row);
+         const restMin100 = restMinutesBetween(
+           lastPenultimoMin,
+           firstCurrMin,
+           2
+         );
+         if (restMin100 > 0 && restMin100 < cParsed.hsVrNot100Min) {
+           const diff100 = cParsed.hsVrNot100Min - restMin100;
+           d_vr100 = minutesToHHMM(diff100);
+         }
+       }
+     }
+
+     return {
+       d_he50,
+       d_int50,
+       d_he100,
+       d_int100,
+       d_folga: d_folga_min > 0 ? minutesToHHMM(d_folga_min) : "",
+       d_feriado: d_feriado_min > 0 ? minutesToHHMM(d_feriado_min) : "",
+       d_vr50,
+       d_vr100,
+     };
+   }
+
+/* =======================================================================
+   >>> BLOCO COMPLETO — CÁLCULO DO APONTAMENTO NOTURNO (ORGANIZADO) <<<
+   >>> ZERO ALTERAÇÃO DE LÓGICA — APENAS LIMPEZA E MODULARIZAÇÃO     <<<
+   ======================================================================= */
+// Dependências centralizadas (antes estavam soltas pelo código)
+const NoturnoDeps = {
+  hhmmToMinutes,
+  minutesToHHMM,
+  getAjusteTipo,
+  getCumprirByJornada,
+  MIN_PER_DAY,
+  UMA_HORA,
+  cond,
+};
+/* ============================================================
+      1) DEFINIR JANELA NOTURNA 
+   ============================================================ */
+function getJanelaNoturna() {
+  const notIniStr = cond?.periodo_noturno_inicio || "00:00";
+  const notFimStr = cond?.periodo_noturno_fim || "00:00";
+
+  return {
+    notIniMin: hhmmToMinutes(notIniStr),
+    notFimMin: hhmmToMinutes(notFimStr),
+  };
+}
+
+/* ============================================================
+      2) UTILITÁRIO — CONTAR MINUTOS NA FAIXA NOTURNA
+   ============================================================ */
+function minutosNoturnos(e, s, notIniMin, notFimMin) {
+  if (!e || !s) return 0;
+
+  let ini = e;
+  let fim = s;
+
+  if (fim < ini) fim += NoturnoDeps.MIN_PER_DAY;
+
+  let tot = 0;
+
+  for (let t = ini; t < fim; t++) {
+    const mm = t % NoturnoDeps.MIN_PER_DAY;
+    if (mm >= notIniMin || mm < notFimMin) tot++;
+  }
+  return tot;
+}
+
+/* ============================================================
+      3) ADICIONAL NOTURNO — TEMPO ANTES (E1→notFim) + DEPOIS
+   ============================================================ */
+function calcAdicionalNoturno(row, notIniMin, notFimMin) {
+  const { hhmmToMinutes, MIN_PER_DAY } = NoturnoDeps;
+
+  const mE1 = hhmmToMinutes(row.jc_e1);
+  const mS1 = hhmmToMinutes(row.jc_s1);
+  const mE2 = hhmmToMinutes(row.jc_e2);
+  const mS2 = hhmmToMinutes(row.jc_s2);
+  const mX1 = hhmmToMinutes(row.jc_x1);
+  const mX2 = hhmmToMinutes(row.jc_x2);
+
+  // --------------------------------------------
+  // 🔹 1) NOVO: Adicional entre E1 antecipada e noturno_fim
+  // --------------------------------------------
+  let extraInicio = 0;
+  if (mE1 > 0 && notFimMin > 0 && mE1 < notFimMin) {
+    extraInicio = notFimMin - mE1;
+  }
+
+  // --------------------------------------------
+  // 🔹 2) CÓDIGO ORIGINAL — SEM ALTERAR NADA
+  // --------------------------------------------
+  const lastExit = (mX2 || mS2 || mS1 || 0);
+  if (!lastExit) return extraInicio;
+
+  const entryCandidates = [mE1, mE2, mX1].filter((v) => v > 0);
+  let earliestEntry = null;
+  if (entryCandidates.length > 0) {
+    earliestEntry = entryCandidates.reduce(
+      (min, v) => (min === null || v < min ? v : min),
+      null
+    );
+  }
+
+  let lastExitTime = lastExit;
+
+  if (earliestEntry !== null && lastExit < earliestEntry) {
+    lastExitTime += MIN_PER_DAY;
+  }
+
+  let extraFim = 0;
+  if (lastExitTime > notIniMin) {
+    extraFim = lastExitTime - notIniMin;
+  }
+
+  // --------------------------------------------
+  // 🔹 3) Soma final
+  // --------------------------------------------
+  return extraInicio + extraFim;
+}
+
+/* ============================================================
+      4) HORA NOTURNA REDUZIDA
+   ============================================================ */
+function calcHoraNoturnaReduzida(adicional, cParsed) {
+  if (!adicional || adicional <= 0) return 0;
+
+  const perHourReduction =
+    cParsed.horaNoturnaReduzidaMin > 0
+      ? cParsed.horaNoturnaReduzidaMin
+      : 7.5;
+
+  const perRealHour = 60 - perHourReduction;
+
+  const horasInteiras = Math.floor(adicional / 60);
+  const minutosRest = adicional % 60;
+
+  const reducedMinutes =
+    horasInteiras * perHourReduction +
+    (minutosRest * perHourReduction) / 60;
+
+  if (reducedMinutes >= perRealHour) {
+    return Math.round((reducedMinutes / perRealHour) * 60);
+  }
+
+  return Math.round(reducedMinutes);
+}
+
+// ============================================================
+// FOLGA (N) — Função isolada e autossuficiente
+// Mantém exatamente a mesma lógica que funciona hoje
+// Retorna HH:MM diretamente
+// ============================================================
+function calcFolgaN(row, cParsed) {
+  const {
+    hhmmToMinutes,
+    minutesToHHMM,
+    MIN_PER_DAY,
+    cond,
+  } = NoturnoDeps;
+
+  // Condições do banco (sem números fixos)
+  const mAncoragemIni   = hhmmToMinutes(cond.ancoragem_noturna_inicio);
+  const mPeriodoNotIni  = hhmmToMinutes(cond.periodo_noturno_inicio);
+
+  // Marcações reais
+  const mE1 = hhmmToMinutes(row.jc_e1);
+  const mS1 = hhmmToMinutes(row.jc_s1);
+  const mE2 = hhmmToMinutes(row.jc_e2);
+  const mS2 = hhmmToMinutes(row.jc_s2);
+  const mX1 = hhmmToMinutes(row.jc_x1);
+  const mX2 = hhmmToMinutes(row.jc_x2);
+
+  // Última batida real
+  const mEnd = (mX2 || mS2 || mS1 || 0);
+  if (!mEnd) return "";
+
+  // Regra principal (já validada no seu sistema)
+  const isJornadaNoturna = (mE1 && mE1 >= mAncoragemIni);
+  if (!isJornadaNoturna) return "";
+
+  // Início da contagem
+  const mStart = Math.max(mPeriodoNotIni, mE1 || 0);
+
+  let minutos = 0;
+
+  if (mEnd > mStart) {
+    minutos = mEnd - mStart;
+  } else {
+    minutos = (mEnd + MIN_PER_DAY) - mStart;
+  }
+
+  // Teto pelo total da jornada a cumprir
+  const totalCond = cParsed.totalHorasJornada;
+  const base = (minutos >= totalCond && totalCond > 0)
+    ? totalCond
+    : minutos;
+
+  // Retorna HH:MM
+  return base > 0 ? minutesToHHMM(base) : "";
+}
+
+// ============================================================
+// FERIADO (N) — Função isolada e autossuficiente
+// Mantém exatamente a mesma lógica que já funciona hoje
+// Retorna HH:MM diretamente
+// ============================================================
+function calcFeriadoN(row, cParsed) {
+  const {
+    hhmmToMinutes,
+    minutesToHHMM,
+    MIN_PER_DAY,
+    cond,
+  } = NoturnoDeps;
+
+  // Condições reais do banco
+  const mAncoragemIni   = hhmmToMinutes(cond.ancoragem_noturna_inicio);
+  const mPeriodoNotIni  = hhmmToMinutes(cond.periodo_noturno_inicio);
+
+  // Marcações reais
+  const mE1 = hhmmToMinutes(row.jc_e1);
+  const mS1 = hhmmToMinutes(row.jc_s1);
+  const mE2 = hhmmToMinutes(row.jc_e2);
+  const mS2 = hhmmToMinutes(row.jc_s2);
+  const mX1 = hhmmToMinutes(row.jc_x1);
+  const mX2 = hhmmToMinutes(row.jc_x2);
+
+  // Última batida real
+  const mEnd = (mX2 || mS2 || mS1 || 0);
+  if (!mEnd) return "";
+
+  // Regra principal — EXATAMENTE igual à Folga
+  const isJornadaNoturna = (mE1 && mE1 >= mAncoragemIni);
+  if (!isJornadaNoturna) return "";
+
+  // Início da contagem
+  const mStart = Math.max(mPeriodoNotIni, mE1 || 0);
+
+  let minutos = 0;
+
+  if (mEnd > mStart) {
+    minutos = mEnd - mStart;
+  } else {
+    minutos = (mEnd + MIN_PER_DAY) - mStart;
+  }
+
+  // Teto pelo total da jornada a cumprir
+  const totalCond = cParsed.totalHorasJornada;
+  const base = (minutos >= totalCond && totalCond > 0)
+    ? totalCond
+    : minutos;
+
+  // Retorno final em HH:MM
+  return base > 0 ? minutesToHHMM(base) : "";
+}
+
+// ============================================================
+// INTERVALO 50% (N) — Função isolada e autossuficiente
+// Mesma lógica usada hoje no cálculo de intervalo noturno,
+// porém exclusiva para dias comuns (não folga, não feriado)
+// Retorna HH:MM diretamente
+// ============================================================
+function calcIntervalo50N(row, cParsed) {
+  const {
+    hhmmToMinutes,
+    minutesToHHMM,
+    MIN_PER_DAY,
+    getCumprirByJornada
+  } = NoturnoDeps;
+
+  const j = getCumprirByJornada(row);
+
+  const mE1  = hhmmToMinutes(row.jc_e1);
+  const mS1  = hhmmToMinutes(row.jc_s1);
+  const mE2  = hhmmToMinutes(row.jc_e2);
+  const mS2  = hhmmToMinutes(row.jc_s2);
+
+  const mE1c = hhmmToMinutes(j.E1c);
+  const mS1c = hhmmToMinutes(j.S1c);
+
+  // Jornada noturna (regra atual)
+  const isJornadaNoturna = mE1c && mE1c >= hhmmToMinutes(cond.periodo_noturno_inicio);
+
+  // Não considera intervalos se:
+  // - não for jornada noturna
+  // - não houver marcações suficientes
+  // - houver segundo período (E2/S2)
+  const temSegundoPeriodo = !!(mE2 || mS2);
+
+  if (!(isJornadaNoturna && mE1 && mS1 && !temSegundoPeriodo)) {
+    return "";
+  }
+
+  // Duração do período E1 → S1
+  let dur = mS1 - mE1;
+  if (dur < 0) dur += MIN_PER_DAY;
+
+  // Jornada mínima p/ gerar intervalo
+  const minInt = cParsed.jornadaMinIntervalo || 0;
+
+  // Se atingir o mínimo → 1h (100% do período)
+  if (dur >= minInt) {
+    return minutesToHHMM(NoturnoDeps.UMA_HORA);
+  }
+
+  return "";
+}
+
+// ============================================================
+// INTERVALO 100% (N) — Função isolada e autossuficiente
+// Usada APENAS em folga/feriado
+// Mantém exatamente a mesma lógica do intervalo noturno atual
+// Retorna HH:MM diretamente
+// ============================================================
+function calcIntervalo100N(row, cParsed) {
+  const {
+    hhmmToMinutes,
+    minutesToHHMM,
+    MIN_PER_DAY,
+    getCumprirByJornada,
+    cond,
+    UMA_HORA
+  } = NoturnoDeps;
+
+  const j = getCumprirByJornada(row);
+
+  const mE1  = hhmmToMinutes(row.jc_e1);
+  const mS1  = hhmmToMinutes(row.jc_s1);
+  const mE2  = hhmmToMinutes(row.jc_e2);
+  const mS2  = hhmmToMinutes(row.jc_s2);
+
+  const mE1c = hhmmToMinutes(j.E1c);
+
+  // Jornada noturna (mesma regra atual)
+  const mPeriodoNotIni = hhmmToMinutes(cond.periodo_noturno_inicio);
+  const isJornadaNoturna = mE1c && mE1c >= mPeriodoNotIni;
+
+  // Em folga/feriado, o intervalo é 100% só SE existir intervalo válido
+  const temSegundoPeriodo = !!(mE2 || mS2);
+
+  if (!(isJornadaNoturna && mE1 && mS1 && !temSegundoPeriodo)) {
+    return "";
+  }
+
+  // Duração do período E1 → S1
+  let dur = mS1 - mE1;
+  if (dur < 0) dur += MIN_PER_DAY;
+
+  // Jornada mínima p/ intervalo
+  const minInt = cParsed.jornadaMinIntervalo || 0;
+
+  if (dur >= minInt) {
+    return minutesToHHMM(UMA_HORA); // 1h = intervalo 100%
+  }
+
+  return "";
+}
+
+// ============================================================
+// H.E. 50% (N) — COMPLETA: início + fim + fim-diurna + inicio-diurna
+// ============================================================
+function calcHE50N(row, cParsed) {
+  const {
+    hhmmToMinutes,
+    minutesToHHMM,
+    MIN_PER_DAY,
+    getCumprirByJornada,
+    getAjusteTipo,
+    cond
+  } = NoturnoDeps;
+
+  const { isFolga, isFeriado } = getAjusteTipo(row);
+  if (isFolga || isFeriado) return ""; // nunca 50% nesses casos
+
+  // --- CONDIÇÕES DO BANCO ---
+  const mAncoragemIni  = hhmmToMinutes(cond.ancoragem_noturna_inicio);
+  const mPeriodoNotIni = hhmmToMinutes(cond.periodo_noturno_inicio);
+  const mPeriodoNotFim = hhmmToMinutes(cond.periodo_noturno_fim);
+
+  // --- MARCAÇÕES REAIS ---
+  const mE1 = hhmmToMinutes(row.jc_e1);
+  const mS1 = hhmmToMinutes(row.jc_s1);
+  const mE2 = hhmmToMinutes(row.jc_e2);
+  const mS2 = hhmmToMinutes(row.jc_s2);
+  const mX2 = hhmmToMinutes(row.jc_x2);
+
+  // --- JORNADA A CUMPRIR ---
+  const j = getCumprirByJornada(row);
+  const mE1c = hhmmToMinutes(j.E1c);
+  const mS1c = hhmmToMinutes(j.S1c);
+  const mS2c = hhmmToMinutes(j.S2c);
+
+  const saidaPrev = mS2c || mS1c || 0;
+  const saidaReal = mX2 || mS2 || mS1 || 0;
+
+  const tol = cParsed.tolHE || 0;
+  let total = 0;
+
+  // ============================================================
+  // DEFINIÇÃO DA JORNADA NOTURNA
+  // ============================================================
+  const isJornadaNoturna = (mE1 >= mAncoragemIni);
+
+  // ============================================================
+  // 1) H.E. INÍCIO — NOTURNA (CORRIGIDO)
+  // ============================================================
+  if (isJornadaNoturna) {
+    if (mE1 && mE1c && mE1 < mE1c) {
+
+      // *** CORREÇÃO AQUI ***
+      // Entrada antes do início do período noturno → só conta a partir do período noturno
+      let ini = mE1;
+      if (ini < mPeriodoNotIni) ini = mPeriodoNotIni;
+
+      if (ini < mE1c) {
+        let diffIni = mE1c - ini;
+        if (diffIni > tol) total += diffIni;
+      }
+    }
+  }
+
+  // ============================================================
+  // 1b) H.E. INÍCIO — DIURNA → NOVA REGRA
+  // ============================================================
+  if (!isJornadaNoturna) {
+    if (mE1 && mE1 < mPeriodoNotFim) {
+
+      let ini = mE1;
+      let fim = mPeriodoNotFim;
+
+      if (fim < ini) fim += MIN_PER_DAY;
+      let minutos = fim - ini;
+
+      if (minutos > tol) {
+        total += minutos;
+      }
+    }
+  }
+
+  // ============================================================
+  // 2) H.E. FIM — NOTURNA (regra antiga mantida)
+  // ============================================================
+  if (isJornadaNoturna) {
+    if (saidaReal && saidaPrev && saidaReal > saidaPrev) {
+      let diffFim = saidaReal - saidaPrev;
+      if (diffFim > tol) total += diffFim;
+    }
+  }
+
+  // ============================================================
+  // 3) H.E. FIM — DIURNA
+  // ============================================================
+  if (!isJornadaNoturna) {
+    if (saidaPrev >= mPeriodoNotIni) {
+      if (saidaReal > saidaPrev) {
+        const diff = saidaReal - saidaPrev;
+
+        if (diff > tol) {
+          let excedente = 0;
+          let ini = saidaPrev;
+          let fim = saidaReal;
+
+          if (fim < ini) fim += MIN_PER_DAY;
+
+          for (let t = ini; t < fim; t++) {
+            const mm = t % MIN_PER_DAY;
+            if (mm >= mPeriodoNotIni) excedente++;
+          }
+
+          total += excedente;
+        }
+      }
+    }
+  }
+
+  return total > 0 ? minutesToHHMM(total) : "";
+}
+
+// ============================================================
+// H.E. 100% (N) — COMPLETA: início + fim
+// Só calcula quando Ajuste = Folga ou Feriado
+// ============================================================
+function calcHE100N(row, cParsed) {
+  const {
+    hhmmToMinutes,
+    minutesToHHMM,
+    MIN_PER_DAY,
+    getCumprirByJornada,
+    getAjusteTipo,
+    cond
+  } = NoturnoDeps;
+
+  const { isFolga, isFeriado } = getAjusteTipo(row);
+
+  // Só funciona em Folga ou Feriado
+  if (!isFolga && !isFeriado) return "";
+
+  // --- CONDIÇÕES DO BANCO ---
+  const mAncoragemIni  = hhmmToMinutes(cond.ancoragem_noturna_inicio);
+  const mPeriodoNotIni = hhmmToMinutes(cond.periodo_noturno_inicio);
+  const mPeriodoNotFim = hhmmToMinutes(cond.periodo_noturno_fim);
+
+  // --- MARCAÇÕES REAIS ---
+  const mE1 = hhmmToMinutes(row.jc_e1);
+  const mS1 = hhmmToMinutes(row.jc_s1);
+  const mE2 = hhmmToMinutes(row.jc_e2);
+  const mS2 = hhmmToMinutes(row.jc_s2);
+  const mX2 = hhmmToMinutes(row.jc_x2);
+
+  // --- JORNADA A CUMPRIR ---
+  const j = getCumprirByJornada(row);
+  const mE1c = hhmmToMinutes(j.E1c);
+  const mS1c = hhmmToMinutes(j.S1c);
+  const mS2c = hhmmToMinutes(j.S2c);
+
+  const saidaPrev = mS2c || mS1c || 0;
+  const saidaReal = mX2 || mS2 || mS1 || 0;
+
+  const tol = cParsed.tolHE || 0;
+  let total = 0;
+
+  // ============================================================
+  // DEFINIÇÃO DA JORNADA NOTURNA
+  // ============================================================
+  const isJornadaNoturna = (mE1 >= mAncoragemIni);
+
+  // ============================================================
+  // 1) H.E. INÍCIO — NOTURNA (CORRIGIDO IGUAL AO 50%)
+  // ============================================================
+  if (isJornadaNoturna) {
+    if (mE1 && mE1c && mE1 < mE1c) {
+
+      // Só conta a partir do início do período noturno
+      let ini = mE1;
+      if (ini < mPeriodoNotIni) ini = mPeriodoNotIni;
+
+      if (ini < mE1c) {
+        const diff = mE1c - ini;
+        if (diff > tol) total += diff;
+      }
+    }
+  }
+
+  // ============================================================
+  //  — H.E. INÍCIO — DIURNA
+  //   // ============================================================
+if (!isJornadaNoturna) {
+    if (mE1 && mE1 < mPeriodoNotFim) {
+
+      let ini = mE1;
+      let fim = mPeriodoNotFim;
+
+      if (fim < ini) fim += MIN_PER_DAY;
+      let minutos = fim - ini;
+
+      if (minutos > tol) {
+        total += minutos;
+      }
+    }
+  }
+  
+  // ============================================================
+  // 2) H.E. FIM — NOTURNA (igual ao 50%)
+  // ============================================================
+  if (isJornadaNoturna) {
+    if (saidaReal && saidaPrev && saidaReal > saidaPrev) {
+      let diffFim = saidaReal - saidaPrev;
+      if (diffFim > tol) total += diffFim;
+    }
+  }
+
+  // ============================================================
+  // 3) H.E. FIM — DIURNA (MANTIDO — FUNCIONA CORRETAMENTE)
+  // ============================================================
+  if (!isJornadaNoturna) {
+    if (saidaPrev >= mPeriodoNotIni && saidaReal > saidaPrev) {
+
+      let ini = saidaPrev;
+      let fim = saidaReal;
+      if (fim < ini) fim += MIN_PER_DAY;
+
+      let minutosNoturnos = 0;
+
+      for (let t = ini; t < fim; t++) {
+        const mm = t % MIN_PER_DAY;
+        if (mm >= mPeriodoNotIni) minutosNoturnos++;
+      }
+
+      if (minutosNoturnos > tol) {
+        total += minutosNoturnos;
+      }
+    }
+  }
+
+  return total > 0 ? minutesToHHMM(total) : "";
+}
+
+/* ============================================================
+      8) FUNÇÃO FINAL — DISTRIBUIÇÃO NOTURNA + DESCONTOS
+   ============================================================ */
+function calcNoturnoLinha(row, cParsed, idx, arr) {
+  const { minutesToHHMM, getAjusteTipo } = NoturnoDeps;
+
+  const { isFolga, isFeriado } = getAjusteTipo(row);
+  const { notIniMin } = getJanelaNoturna();
+
+  const adicionalMin = calcAdicionalNoturno(row, notIniMin);
+  const hnRedMin     = calcHoraNoturnaReduzida(adicionalMin, cParsed);
+
+  let n_he50    = "";
+  let n_he100   = "";
+  let n_int50   = "";
+  let n_int100  = "";
+  let n_folga   = "";
+  let n_feriado = "";
+
+  if (isFolga) {
+    n_folga  = calcFolgaN(row, cParsed) || "";
+    n_int100 = calcIntervalo100N(row, cParsed) || "";
+    n_he100  = calcHE100N(row, cParsed) || "";
+  } 
+  else if (isFeriado) {
+    n_feriado = calcFeriadoN(row, cParsed) || "";
+    n_int100  = calcIntervalo100N(row, cParsed) || "";
+    n_he100   = calcHE100N(row, cParsed) || "";
+  } 
+  else {
+    n_int50 = calcIntervalo50N(row, cParsed) || "";
+    n_he50  = calcHE50N(row, cParsed) || "";
+  }
+
+  return {
+    // NOTURNO
+    n_he50,
+    n_int50,
+    n_he100,
+    n_int100,
+    n_folga,
+    n_feriado,
+    n_adnot: adicionalMin > 0 ? minutesToHHMM(adicionalMin) : "",
+    n_hnred: hnRedMin     > 0 ? minutesToHHMM(hnRedMin)     : "",
+
+    // DESCONTOS (agora preservados!)
+    faltas_d: row.faltas_d || "",
+    atrasos_d: row.atrasos_d || "",
+    saida_antecipada_d: row.saida_antecipada_d || "",
+  };
+}
+
+/* ============================================================
+   DESCONTOS — faltas, atrasos, saída antecipada
+   ============================================================ */
+function calcDescontos(row, cParsed) {
+  const {
+    hhmmToMinutes,
+    minutesToHHMM,
+    getAjusteTipo,
+    getCumprirByJornada
+  } = NoturnoDeps;
+
+  let falta = "";
+  let atraso = "";
+  let saidaAnt = "";
+
+  const tipoAj = getAjusteTipo(row);
+
+  // =====================================================================
+  // 1) FALTA  →  sempre 1, sem tolerância
+  // =====================================================================
+  if (tipoAj.isFalta) {
+    return {
+      desc_falta: "1",
+      desc_atraso: "",
+      desc_saida: ""
+    };
+  }
+
+  // =====================================================================
+  // Carregar jornada prevista e batidas reais
+  // =====================================================================
+  const j = getCumprirByJornada(row);
+  const mE1c = hhmmToMinutes(j.E1c);
+  const mS1c = hhmmToMinutes(j.S1c);
+  const mE2c = hhmmToMinutes(j.E2c);
+  const mS2c = hhmmToMinutes(j.S2c);
+
+  const mE1 = hhmmToMinutes(row.jc_e1);
+  const mS1 = hhmmToMinutes(row.jc_s1);
+  const mE2 = hhmmToMinutes(row.jc_e2);
+  const mS2 = hhmmToMinutes(row.jc_s2);
+  const mX2 = hhmmToMinutes(row.jc_x2);
+
+
+// Quantidade flex (dia/hr)
+let flex = hhmmToMinutes(row.grau_diahr) || 0;
+
+const tol = cParsed.tolAtraso || 0;
+
+// =====================================================================
+// 2) ATRASOS — início + retorno do intervalo
+// =====================================================================
+
+let atrasoTotal = 0;
+
+// -----------------------------
+// Atraso no início (E1)
+// -----------------------------
+if (mE1 && mE1c && mE1 > mE1c) {
+  const diff = mE1 - mE1c;
+  if (diff > tol) {
+    atrasoTotal += diff;
+  }
+}
+
+// -----------------------------
+// Atraso por INTERVALO EXCEDIDO (intervalo flexível)
+// -----------------------------
+if (mS1 && mE2 && j?.intervalo_minutos) {
+  const intervaloReal       = mE2 - mS1;
+  const intervaloPermitido  = j.intervalo_minutos;
+
+  if (intervaloReal > intervaloPermitido) {
+    const excedente = intervaloReal - intervaloPermitido;
+
+    // tolerância só decide SE desconta
+    if (excedente > tol) {
+      atrasoTotal += excedente; // desconta só o que passou do permitido
+    }
+  }
+}
+
+// -----------------------------
+// Aplicar o FLEX
+// -----------------------------
+if (atrasoTotal > 0 && flex > 0) {
+  if (flex >= atrasoTotal) {
+    // Flex cobre tudo
+    flex -= atrasoTotal;
+    atrasoTotal = 0;
+  } else {
+    // Flex cobre parcialmente
+    atrasoTotal -= flex;
+    flex = 0;
+  }
+}
+
+// -----------------------------
+// Resultado final
+// -----------------------------
+atraso = atrasoTotal > 0
+  ? minutesToHHMM(atrasoTotal)
+  : "";
+
+// =====================================================================
+  // 3) SAÍDA ANTECIPADA — última batida < S2/S1
+  // =====================================================================
+
+  const previstoSaida = mS2c || mS1c || 0;
+  const realSaida = mX2 || mS2 || mS1 || 0;
+
+  let saidaDiff = 0;
+
+  if (realSaida && previstoSaida && realSaida < previstoSaida) {
+    saidaDiff = previstoSaida - realSaida;
+    if (saidaDiff < 0) saidaDiff += 1440;
+    if (saidaDiff <= tol) saidaDiff = 0;
+  }
+
+  // Aplicar FLEX restante
+  if (saidaDiff > 0 && flex > 0) {
+    if (flex >= saidaDiff) {
+      // Flex cobre tudo
+      flex -= saidaDiff;
+      saidaDiff = 0;
+    } else {
+      // Flex parcial
+      saidaDiff -= flex;
+      flex = 0;
+    }
+  }
+
+  saidaAnt = saidaDiff > 0 ? minutesToHHMM(saidaDiff) : "";
+
+  // =====================================================================
+  // Retorno final
+  // =====================================================================
+  return {
+    desc_falta: "",
+    desc_atraso: atraso,
+    desc_saida: saidaAnt
+  };
+}
+
+/* =========================
+     Cálculo (BOTÃO)
+  ========================== */
+function calcularApontamentos() {
+  try {
+    setMostrarCalculos(true);
+    const cParsed = getCondParsed(cond || {});
+
+    setLinhas((old) =>
+      old.map((row, idx, arr) => {
+        
+        // 1) Cálculos diurnos e noturnos (cada bloco calcula o que lhe pertence)
+        const diurno  = calcDiurnoLinha(row, cParsed, idx, arr);
+        const noturno = calcNoturnoLinha(row, cParsed, idx, arr);
+
+        // 2) Merge sem somar — apenas une os resultados, como deve ser
+        let newRow = { ...row, ...diurno, ...noturno };
+        
+        // 4) DESCONTOS (mantido, pois não interfere no noturno)
+        try {
+          const desc = calcDescontos(row, cParsed);
+
+          newRow.desc_falta  = desc.desc_falta;
+          newRow.desc_atraso = desc.desc_atraso;
+          newRow.desc_saida  = desc.desc_saida;
+
+        } catch (e) {
+          console.error("Erro Descontos", e);
+        }
+
+        return newRow;
+      })
+    );
+
+    setTimeout(syncSpacerWidth, 0);
+
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+  /* =========================
+     Totais: se zero → vazio
+  ========================== */
+  const totalMinutesForKey = (key) =>
+    linhas.reduce((acc, r) => acc + hhmmToMinutes(r[key]), 0);
+  const totalDisplay = (key) => {
+    const m = totalMinutesForKey(key);
+    return m > 0 ? minutesToHHMM(m) : "";
+  };
+
+  /* =========================
+     Menu de contexto (mover marcações)
+  ========================== */
+  function onMarkContextMenu(e, idx, key) {
+    e.preventDefault();
+    setCtxMenu({ show:true, x:e.clientX, y:e.clientY, rowIndex: idx, key });
+  }
+  function closeCtx() { setCtxMenu({ show:false, x:0, y:0, rowIndex:null, key:null }); }
+
+  // >>> Ajuste: movimentação com limites e proteção das vizinhas (apenas SWAP com a célula ao lado)
+  function shiftRightRow(row, startKey) {
+    const idx = MARK_KEYS.indexOf(startKey);
+    if (idx < 0 || idx === MARK_KEYS.length - 1) {
+      // Já está em X2 ou chave inválida → não move
+      return row;
+    }
+    const nextKey = MARK_KEYS[idx + 1];
+    const updated = { ...row };
+    const tmp = updated[nextKey];
+    updated[nextKey] = updated[startKey];
+    updated[startKey] = tmp;
+    return updated;
+  }
+
+  function shiftLeftRow(row, startKey) {
+    const idx = MARK_KEYS.indexOf(startKey);
+    if (idx <= 0) {
+      // Já está em E1 ou chave inválida → não move
+      return row;
+    }
+    const prevKey = MARK_KEYS[idx - 1];
+    const updated = { ...row };
+    const tmp = updated[prevKey];
+    updated[prevKey] = updated[startKey];
+    updated[startKey] = tmp;
+    return updated;
+  }
+
+  function moveSelected(direction) {
+    if (!ctxMenu.show) return;
+    const { rowIndex, key } = ctxMenu;
+    setLinhas(old => old.map((r,i) => {
+      if (i !== rowIndex) return r;
+      return direction === "right" ? shiftRightRow(r, key) : shiftLeftRow(r, key);
+    }));
+    closeCtx();
+  }
+
+  /* =========================
+     Helpers visuais
+  ========================== */
+  // >>> Ajuste: só esconder "00:00" quando exibir_zeros_vazios estiver ativo
+  function displayHHMM(v) {
+    const s = (v || "").trim();
+    if (!s) return "";
+    if (cond?.exibir_zeros_vazios && (s === "00:00" || s === "0:00")) return "";
+    return s;
+  }
+  const contentMaxWidth = "calc(100vw - var(--sidebar-width, 280px) - 24px)";
+
+  const anchorIni = cond?.ancora_noturno_ini || (cond?.ancora_1750_0800 ? "17:50" : "");
+  const anchorFim = cond?.ancora_noturno_fim || (cond?.ancora_1750_0800 ? "08:00" : "");
+  const anchorAtiva = Boolean(anchorIni || anchorFim);
+
+  /* =========================
+     Render
+  ========================== */
+  return (
+    <div className="h-full flex flex-col" onClick={closeCtx}>
+      {/* Cabeçalho fixo */}
+      <div className="sticky top-0 z-30 bg-white/95 backdrop-blur border-b">
+        <div className="px-4 py-1 space-y-1" style={{ maxWidth: contentMaxWidth }}>
+          {/* Filtros */}
+          <div className="flex flex-wrap items-end gap-2 mt-1">
+            <div className="flex flex-col">
+              <label className="text-sm font-medium">Empresa</label>
+              <select
+                value={empresaId}
+                onChange={(e) => { setEmpresaId(e.target.value); setColabId(""); }}
+                className="border rounded-md px-2 py-1 text-[13px]"
+                style={{ width: "8.2cm" }}
+              >
+                <option value="">Selecione a empresa</option>
+                {empresas.map((e) => (
+                  <option key={e.id} value={e.id}>{e.razao_social}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex flex-col">
+              <label className="text-sm font-medium">Colaborador</label>
+              <select
+                value={colabId}
+                onChange={(e) => setColabId(e.target.value)}
+                disabled={!empresaId}
+                className="border rounded-md px-2 py-1 text-[13px]"
+                style={{ width: "8.2cm" }}
+              >
+                <option value="">{empresaId ? "Selecione o colaborador" : "Selecione a empresa antes"}</option>
+                {colabsEmpresa.map((c) => (
+                  <option key={c.id} value={c.id}>{c.nome}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex flex-col">
+              <label className="text-sm font-medium">Período inicial</label>
+              <Input type="date" value={periodoIni} onChange={(e) => setPeriodoIni(e.target.value)} className="border rounded-md h-7 text-[13px]" style={{ width: "4.3cm" }}/>
+            </div>
+            <div className="flex flex-col">
+              <label className="text-sm font-medium">Período final</label>
+              <Input type="date" value={periodoFim} onChange={(e) => setPeriodoFim(e.target.value)} className="border rounded-md h-7 text-[13px]" style={{ width: "4.3cm" }}/>
+            </div>
+
+           {/* Botões */}
+<div className="basis-full h-0" />
+<div className="flex items-center gap-2">
+  <Button
+    size="sm"
+    onClick={gerarPeriodo}
+    className="bg-[#2B6CB0] text-[11px] px-2 h-6"
+  >
+    Gerar período
+  </Button>
+
+  <Button
+    size="sm"
+    onClick={carregarCumprida}
+    className="bg-emerald-600 text-[11px] px-2 h-6"
+  >
+    Jornada cumprida
+  </Button>
+
+  <Button
+    size="sm"
+    onClick={calcularApontamentos}
+    className="bg-indigo-600 text-[11px] px-2 h-6"
+  >
+    Calcular
+  </Button>
+
+  <Button
+    size="sm"
+    onClick={salvarTudo}
+    className="bg-amber-600 text-[11px] px-2 h-6"
+  >
+    Salvar
+  </Button>
+
+  <Button
+    size="sm"
+    onClick={carregarTratadas}
+    className="bg-slate-600 text-[11px] px-2 h-6"
+  >
+    Ver Tratadas
+  </Button>
+</div>
+
+            {/* Contadores */}
+            <div className="basis-full h-0" />
+            <div className="flex gap-2 text-[10px] text-slate-600 mt-[-6px]">
+              <div><b>Dias no período:</b> {diasPeriodo}</div>
+              <div><b>RAW no período (marcações):</b> {rawNoPeriodo}</div>
+              <div><b>Dias com batidas gravadas:</b> {diasComBatidas}</div>
+            </div>
+
+            {/* Indicador de carga das condições */}
+            {empresaId && loadingCond && (
+              <div className="text-[11px] text-slate-500">Carregando condições da empresa…</div>
+            )}
+
+            {/* Faixa de parâmetros (condições) */}
+            {empresaId && (
+              <>
+                <div className="basis-full h-0" />
+                <div className="flex flex-wrap gap-1.5 text-[11px] mt-0.5">
+                  {!cond && (
+                    <span className="px-2 py-[2px] rounded-full bg-slate-100 text-slate-500">
+                      Nenhuma condição cadastrada para esta empresa.
+                    </span>
+                  )}
+
+                  {cond && (
+                    <>
+                      <span className="px-2 py-[2px] rounded-full bg-slate-100 text-slate-700">
+                        Zeros vazios: <b>{cond.exibir_zeros_vazios ? "Sim" : "Não"}</b>
+                      </span>
+
+                      {cond.tol_he_hhmm && (
+                        <span className="px-2 py-[2px] rounded-full bg-slate-100 text-slate-700">
+                          Tol. HE: <b>{cond.tol_he_hhmm}</b> ({cond.tol_he_modo || "por_marcacao"})
+                        </span>
+                      )}
+
+                      {cond.tol_atraso_hhmm && (
+                        <span className="px-2 py-[2px] rounded-full bg-slate-100 text-slate-700">
+                          Tol. Atraso: <b>{cond.tol_atraso_hhmm}</b> ({cond.tol_atraso_modo || "por_marcacao"})
+                        </span>
+                      )}
+
+                      {(cond.ancora_noturno_ini || cond.ancora_noturno_fim || cond.ancora_1750_0800) && (
+                        <span className="px-2 py-[2px] rounded-full bg-slate-100 text-slate-700">
+                          Âncora noturna: <b>{cond.ancora_noturno_ini || (cond.ancora_1750_0800 ? "17:50" : "--:--")} → {cond.ancora_noturno_fim || (cond.ancora_1750_0800 ? "08:00" : "--:--")}</b> {cond?.noturno_fixo || cond?.ancora_1750_0800 ? "(fixo)" : ""}
+                        </span>
+                      )}
+
+                      {cond.jornada_minima_intervalo_hhmm && (
+                        <span className="px-2 py-[2px] rounded-full bg-slate-100 text-slate-700">
+                          Jornada mín. p/ intervalo: <b>{cond.jornada_minima_intervalo_hhmm}</b>
+                        </span>
+                      )}
+
+                      {(cond.periodo_diurno_inicio || cond.periodo_diurno_fim) && (
+                        <span className="px-2 py-[2px] rounded-full bg-slate-100 text-slate-700">
+                          Diurno: <b>{cond.periodo_diurno_inicio || "--:--"} → {cond.periodo_diurno_fim || "--:--"}</b>
+                        </span>
+                      )}
+
+                      {/* Chip “Hora bônus” com a mesma cor dos demais */}
+                      {cond.hora_bonus && (
+                        <span className="px-2 py-[2px] rounded-full bg-slate-100 text-slate-700">
+                          Hora bônus: <b>Ativo</b>
+                        </span>
+                      )}
+
+                      {cond.total_horas_por_jornada && (
+                        <span className="px-2 py-[2px] rounded-full bg-slate-100 text-slate-700">
+                          Total/jornada: <b>{cond.total_horas_por_jornada}</b>
+                        </span>
+                      )}
+                    </>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Barra de rolagem horizontal (TOP sticky) */}
+        <div
+          ref={topScrollRef}
+          onScroll={() => syncFrom("top")}
+          className="sticky top-[calc(100%)] w-full"
+          style={{ maxWidth: contentMaxWidth, height: 14, overflowX: "auto", overflowY: "hidden" }}
+        >
+          <div ref={spacerRef} style={{ height: 1 }} />
+        </div>
+      </div>
+
+      {/* Grade + barra inferior sticky */}
+      <div className="flex-1 px-4 py-2" style={{ maxWidth: contentMaxWidth }}>
+        <Card className="shadow-sm">
+          <CardHeader className="py-1.5">
+            <CardTitle className="text-base"> </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div
+              ref={tableScrollRef}
+              onScroll={() => { syncSpacerWidth(); syncFrom("table"); }}
+              className="relative"
+              style={{ overflowX: "auto", overflowY: "hidden" }}
+            >
+              <div className="min-w-[2600px]">
+                <Table className="text-[13px]">
+                  <TableHeader>
+                    {/* ===== Linha 1: TÍTULOS ===== */}
+                    <TableRow style={{ height: HEAD_ROW_H }} className="[&>*]:py-0">
+                      <TableHead className="!px-1 text-white"
+                        style={{ width: "1cm", position: "sticky", left: 0, zIndex: 5, background: GRADIENT, boxShadow: "2px 0 0 #E5E7EB", paddingTop: HEAD_PAD_Y, paddingBottom: HEAD_PAD_Y, lineHeight: "1.05" }}>
+                        Data
+                      </TableHead>
+                      <TableHead className="!px-1 text-white"
+                        style={{ width: "1cm", position: "sticky", left: "1cm", zIndex: 5, background: GRADIENT, boxShadow: "2px 0 0 #E5E7EB", paddingTop: HEAD_PAD_Y, paddingBottom: HEAD_PAD_Y, lineHeight: "1.05" }}>
+                        Dia
+                      </TableHead>
+
+                      <TableHead className="text-center !px-1 text-white"
+                        style={{ width: "2.5cm", background: GRADIENT, paddingTop: HEAD_PAD_Y, paddingBottom: HEAD_PAD_Y, lineHeight: "1.05" }}>
+                        Jornada a cumprir
+                      </TableHead>
+
+                      <TableHead className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+
+                      <TableHead className="text-center !px-1 text-white border-l-4"
+                        style={{ borderColor: SEP_COLOR, background: GRADIENT, paddingTop: HEAD_PAD_Y, paddingBottom: HEAD_PAD_Y, lineHeight: "1.05" }}
+                        colSpan={6}>
+                        Jornada Cumprida
+                      </TableHead>
+
+                      <TableHead className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+
+                      <TableHead className="text-center !px-1 text-white border-l-4"
+                        style={{ borderColor: SEP_COLOR, background: GRADIENT, paddingTop: HEAD_PAD_Y, paddingBottom: HEAD_PAD_Y, lineHeight: "1.05", width: AJUSTE_WIDTH_CM }}>
+                        Ajuste
+                      </TableHead>
+                      <TableHead className="text-center !px-1 text-white"
+                        style={{ background: GRADIENT, paddingTop: HEAD_PAD_Y, paddingBottom: HEAD_PAD_Y, lineHeight: "1.05", width: DIAHR_WIDTH_CM }}>
+                        Dia/Hr
+                      </TableHead>
+
+                      {mostrarCalculos && (
+                        <>
+                          <TableHead className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+                          <TableHead className="text-center !px-1 text-white border-l-4" style={{ borderColor: SEP_COLOR, background: GRADIENT, paddingTop: HEAD_PAD_Y, paddingBottom: HEAD_PAD_Y, lineHeight: "1.05" }} colSpan={8}>Apontamentos diurnos</TableHead>
+                          <TableHead className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+                          <TableHead className="text-center !px-1 text-white border-l-4" style={{ borderColor: SEP_COLOR, background: GRADIENT, paddingTop: HEAD_PAD_Y, paddingBottom: HEAD_PAD_Y, lineHeight: "1.05" }} colSpan={10}>Apontamentos noturnos</TableHead>
+                          <TableHead className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+                          <TableHead className="text-center !px-1 text-white border-l-4" style={{ borderColor: SEP_COLOR, background: GRADIENT, paddingTop: HEAD_PAD_Y, paddingBottom: HEAD_PAD_Y, lineHeight: "1.05" }} colSpan={3}>Descontos</TableHead>
+                        </>
+                      )}
+                    </TableRow>
+
+                    {/* ===== Linha 2: SUBTÍTULOS ===== */}
+                    <TableRow style={{ height: SUBHEAD_ROW_H }} className="[&>*]:py-0">
+                      <TableHead className="!px-1 text-white"
+                        style={{ width: "1cm", position: "sticky", left: 0, zIndex: 5, background: GRADIENT, boxShadow: "2px 0 0 #E5E7EB", paddingTop: SUBHEAD_PAD_Y, paddingBottom: SUBHEAD_PAD_Y, lineHeight: "1.05" }}>
+                        DD
+                      </TableHead>
+                      <TableHead className="!px-1 text-white"
+                        style={{ width: "1cm", position: "sticky", left: "1cm", zIndex: 5, background: GRADIENT, boxShadow: "2px 0 0 #E5E7EB", paddingTop: SUBHEAD_PAD_Y, paddingBottom: SUBHEAD_PAD_Y, lineHeight: "1.05" }}>
+                        Dia
+                      </TableHead>
+
+                      <TableHead className="text-center !px-1 text-white" style={{ width: "2.5cm", background: GRADIENT, paddingTop: SUBHEAD_PAD_Y, paddingBottom: SUBHEAD_PAD_Y, lineHeight: "1.05" }}>Alterar</TableHead>
+
+                      <TableHead className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+
+                      {["E1","S1","E2","S2","X1","X2"].map((h) => (
+                        <TableHead key={h} className="text-center text-slate-900" style={{ ...hhmmCellStyle, paddingTop: SUBHEAD_PAD_Y, paddingBottom: SUBHEAD_PAD_Y, lineHeight: "1.05" }}>{h}</TableHead>
+                      ))}
+
+                      <TableHead className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+
+                      <TableHead className="text-center border-l-4 !px-1 text-white" style={{ borderColor: SEP_COLOR, width: AJUSTE_WIDTH_CM, background: GRADIENT, paddingTop: SUBHEAD_PAD_Y, paddingBottom: SUBHEAD_PAD_Y, lineHeight: "1.05" }}>do dia</TableHead>
+                      <TableHead className="text-center !px-1 text-white" style={{ width: DIAHR_WIDTH_CM, background: GRADIENT, paddingTop: SUBHEAD_PAD_Y, paddingBottom: SUBHEAD_PAD_Y, lineHeight: "1.05" }}>Dia/Hr</TableHead>
+
+                      {mostrarCalculos && (
+                        <>
+                          <TableHead className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+                          {[
+                            "H.E. 50% (D)",
+                            "Int. 50% (D)",
+                            "H.E. 100% (D)",
+                            "Int 100% (D)",
+                            "Folga (D)",
+                            "Feriado (D)",
+                            // VR noturno permanece sem sufixo pois não é uma coluna de apontamento diurno
+                            "Vr not 50%",
+                            "Vr not 100%",
+                          ].map((h) => (
+                            <TableHead key={`d_${h}`} className="text-center" style={{ ...hhmmCellStyle, paddingTop: SUBHEAD_PAD_Y, paddingBottom: SUBHEAD_PAD_Y, lineHeight: "1.05" }}>{h}</TableHead>
+                          ))}
+                          <TableHead className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+                          {[
+                            "H.E. 50% (N)",
+                            "Int. 50% (N)",
+                            "H.E. 100% (N)",
+                            "Int 100% (N)",
+                            "Folga (N)",
+                            "Feriado (N)",
+                            // Exceções: Ad. Noturno e Hora Noturna Reduzida não recebem sufixo (N)
+                            "Ad. Not.",
+                            "H. not. red.",
+                          ].map((h) => (
+                            <TableHead key={`n_${h}`} className="text-center" style={{ ...hhmmCellStyle, paddingTop: SUBHEAD_PAD_Y, paddingBottom: SUBHEAD_PAD_Y, lineHeight: "1.05" }}>{h}</TableHead>
+                          ))}
+                          <TableHead className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+                          {["Faltas","Atrasos","S. Antecip"].map((h) => (
+                            <TableHead key={`ds_${h}`} className="text-center" style={{ ...hhmmCellStyle, paddingTop: SUBHEAD_PAD_Y, paddingBottom: SUBHEAD_PAD_Y, lineHeight: "1.05" }}>{h}</TableHead>
+                          ))}
+                        </>
+                      )}
+                    </TableRow>
+                  </TableHeader>
+
+                  <TableBody>
+  {!gridHasData ? (
+    <TableRow>
+      <TableCell colSpan={mostrarCalculos ? 1000 : 16} className="text-center py-5 text-slate-500">
+        Defina filtros e clique em <b>Gerar período</b>.
+      </TableCell>
+    </TableRow>
+  ) : (
+    <>
+      {linhas.map((row, idx) => {
+        const ajusteStyle = getAjusteStyle(row);
+        const ro = isCumpridaReadOnly(row);
+        return (
+        <TableRow key={row.dateISO} className="[&>*]:py-[4px]">
+          
+          {/* Data (sticky) */}
+          <TableCell className="!px-1 font-semibold"
+            style={{ width: "1cm", position: "sticky", left: 0, zIndex: 4, background: "white", boxShadow: "2px 0 0 #E5E7EB" }}>
+            {row.dd}
+          </TableCell>
+
+          {/* Dia (sticky) */}
+          <TableCell className="!px-1"
+            style={{ width: "1cm", position: "sticky", left: "1cm", zIndex: 4, background: "white", boxShadow: "2px 0 0 #E5E7EB" }}>
+            {["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"][new Date(row.dateISO).getDay()]}
+          </TableCell>
+
+          {/* Jornada a cumprir */}
+          <TableCell className="text-center !px-1" style={{ width: "2.5cm", background: BG_CUMPRIDA }}>
+            <select
+              className="w-full border rounded-md px-1 py-[3px] text-[10px] truncate"
+              value={row.jSel || ""}
+              onChange={(e) => aplicarJornada(idx, e.target.value)}
+            >
+              <option value="">Alterar</option>
+              {jornadas.map((j) => <option key={j.id} value={j.id}>{j.descricao}</option>)}
+            </select>
+          </TableCell>
+
+          {/* sep fino */}
+          <TableCell className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+
+          {/* Jornada Cumprida (E1..X2) */}
+          {MARK_KEYS.map((k) => (
+            <TableCell key={k} className="text-center" style={{ ...hhmmCellStyle, background: BG_CUMPRIDA }}>
+              <Input
+                value={getCumpridaDisplay(row, k)}
+                readOnly={ro}
+                onContextMenu={(e)=>onMarkContextMenu(e, idx, k)}
+                onChange={(e) => setLinhas((old) => old.map((r,i2) => i2===idx ? { ...r, [k]: e.target.value } : r))}
+                onBlur={() => setLinhas((old) => old.map((r,i2) => {
+                  if (i2!==idx) return r;
+                  const val = r[k];
+                  if (/^\s*(\d{1,4}|\d{1,2}:\d{2})\s*$/.test(String(val || ""))) {
+                    return { ...r, [k]: normalizeTime(val) };
+                  }
+                  return r;
+                }))}
+                className={`h-6 text-[12px] ${ro ? "bg-slate-100 text-slate-500 cursor-not-allowed" : ""}`}
+                style={{ width: "100%", ...getCumpridaCellStyle(row, k) }}
+                placeholder="00:00"
+              />
+            </TableCell>
+          ))}
+
+          {/* sep fino */}
+          <TableCell className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+
+          {/* Ajuste */}
+          <TableCell className="text-center border-l-4 !px-1" style={{ borderColor: SEP_COLOR, width: AJUSTE_WIDTH_CM, ...ajusteStyle }}>
+            <select
+              className="w-full border rounded-md px-1 py-[3px] text-[11px] truncate"
+              value={row.ajuste_id || ""}
+              onChange={(e) => setLinhas((old) => old.map((r,i2) => i2===idx ? { ...r, ajuste_id: e.target.value } : r))}
+            >
+              <option value="">Selecione</option>
+              {justificativas.map((j) => <option key={j.id} value={j.id}>{j.descricao}</option>)}
+            </select>
+          </TableCell>
+
+          {/* DIA/HR (AGORA COM MÁSCARA HH:MM) */}
+          <TableCell className="text-center !px-1" style={{ width: DIAHR_WIDTH_CM, background: BG_AJUSTE }}>
+            <Input
+              value={row.grau_diahr || ""}
+              onChange={(e) => setLinhas((old) => old.map((r,i2) => i2===idx ? { ...r, grau_diahr: e.target.value } : r))}
+              onBlur={() =>
+                setLinhas((old) =>
+                  old.map((r,i2) =>
+                    i2 === idx
+                      ? {
+                          ...r,
+                          grau_diahr:
+                            /^\s*(\d{1,4}|\d{1,2}:\d{2})\s*$/.test(String(r.grau_diahr || ""))
+                              ? normalizeTime(r.grau_diahr)
+                              : r.grau_diahr
+                        }
+                      : r
+                  )
+                )
+              }
+              className="h-6 text-[12px] px-1"
+              placeholder="00:00"
+            />
+          </TableCell>
+
+          {/* ================================================================== */}
+          {/* Cálculo */}
+          {/* ================================================================== */}
+          {mostrarCalculos && (
+            <>
+              {/* sep fino */}
+              <TableCell className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+
+              {/* DIURNO */}
+              {DIURNO_KEYS.map((key) => (
+                <TableCell key={key} className="text-center" style={{ ...hhmmCellStyle, background: BG_DIURNO }}>
+                  <Input
+                    value={displayHHMM(row[key])}
+                    onChange={(e) => setLinhas((old) => old.map((r,i2) => i2===idx ? { ...r, [key]: e.target.value } : r))}
+                    onBlur={() => setLinhas((old) => old.map((r,i2) => i2===idx ? { ...r, [key]: normalizeTime(r[key]) } : r))}
+                    className="h-6 text-[12px] bg-slate-50"
+                    style={{ width: "100%" }}
+                    placeholder=""
+                  />
+                </TableCell>
+              ))}
+
+              {/* sep fino */}
+              <TableCell className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+
+              {/* NOTURNO */}
+              {NOTURNO_KEYS.map((key) => (
+                <TableCell key={key} className="text-center" style={{ ...hhmmCellStyle, background: BG_NOTURNO }}>
+                  <Input
+                    value={displayHHMM(row[key])}
+                    onChange={(e) => setLinhas((old) => old.map((r,i2) => i2===idx ? { ...r, [key]: e.target.value } : r))}
+                    onBlur={() => setLinhas((old) => old.map((r,i2) => i2===idx ? { ...r, [key]: normalizeTime(r[key]) } : r))}
+                    className="h-6 text-[12px] bg-slate-50"
+                    style={{ width: "100%" }}
+                    placeholder=""
+                  />
+                </TableCell>
+              ))}
+
+              {/* sep fino */}
+              <TableCell className="!px-0" style={{ width: SEP_WIDTH_CM, minWidth: SEP_WIDTH_CM, maxWidth: SEP_WIDTH_CM, background: SEP_COLOR }} />
+
+              {/* DESCONTOS */}
+              {DESC_KEYS.map((key) => (
+                <TableCell key={key} className="text-center" style={{ ...hhmmCellStyle, background: BG_DESC }}>
+                  <Input
+                    value={displayHHMM(row[key])}
+                    onChange={(e) => setLinhas((old) => old.map((r,i2) => i2===idx ? { ...r, [key]: e.target.value } : r))}
+                    onBlur={() => setLinhas((old) => old.map((r,i2) => i2===idx ? { ...r, [key]: normalizeTime(r[key]) } : r))}
+                    className="h-6 text-[12px] bg-slate-50"
+                    style={{ width: "100%" }}
+                    placeholder=""
+                  />
+                </TableCell>
+              ))}
+            </>
+          )}
+        </TableRow>
+      )})}
+
+                        {/* ===== Linha de TOTAIS ===== */}
+                        {mostrarCalculos && (
+                          <TableRow className="[&>*]:py-[6px]">
+                            {/* colunas fixas vazias + label Totais */}
+                            <TableCell className="!px-1 font-semibold" style={{ width: "1cm", position: "sticky", left: 0, zIndex: 3, background: "#F8FAFF", boxShadow: "2px 0 0 #E5E7EB" }}></TableCell>
+                            <TableCell className="!px-1" style={{ width: "1cm", position: "sticky", left: "1cm", zIndex: 3, background: "#F8FAFF", boxShadow: "2px 0 0 #E5E7EB" }}></TableCell>
+                            <TableCell className="text-center font-semibold" style={{ width: "2.5cm", background: "#F8FAFF" }}>Totais</TableCell>
+
+                            {/* separadores + cumprida vazia */}
+                            <TableCell className="!px-0" style={{ width: SEP_WIDTH_CM, background: SEP_COLOR }} />
+                            {Array.from({length: 6}).map((_,i)=>(
+                              <TableCell key={`t_jc_${i}`} style={{ ...hhmmCellStyle, background: "#F8FAFF" }} />
+                            ))}
+                            <TableCell className="!px-0" style={{ width: SEP_WIDTH_CM, background: SEP_COLOR }} />
+
+                            {/* Ajuste/Grau vazios */}
+                            <TableCell style={{ width: AJUSTE_WIDTH_CM, background: "#F8FAFF" }} />
+                            <TableCell style={{ width: DIAHR_WIDTH_CM, background: "#F8FAFF" }} />
+
+                            {/* Totais Diurnos */}
+                            <TableCell className="!px-0" style={{ width: SEP_WIDTH_CM, background: SEP_COLOR }} />
+                            {DIURNO_KEYS.map((key)=>(
+                              <TableCell key={`t_${key}`} className="text-center font-semibold" style={{ ...hhmmCellStyle, background: "#EEF6FF" }}>
+                                {totalDisplay(key)}
+                              </TableCell>
+                            ))}
+
+                            {/* Totais Noturnos */}
+                            <TableCell className="!px-0" style={{ width: SEP_WIDTH_CM, background: SEP_COLOR }} />
+                            {NOTURNO_KEYS.map((key)=>(
+                              <TableCell key={`t_${key}`} className="text-center font-semibold" style={{ ...hhmmCellStyle, background: "#EEF4FF" }}>
+                                {totalDisplay(key)}
+                              </TableCell>
+                            ))}
+
+                            {/* Totais Descontos */}
+                            <TableCell className="!px-0" style={{ width: SEP_WIDTH_CM, background: SEP_COLOR }} />
+                            {DESC_KEYS.map((key)=>(
+                              <TableCell key={`t_${key}`} className="text-center font-semibold" style={{ ...hhmmCellStyle, background: "#F2F7FF" }}>
+                                {totalDisplay(key)}
+                              </TableCell>
+                            ))}
+                          </TableRow>
+                        )}
+                      </>
+                    )}
+                  </TableBody>
+                </Table>
+              </div>
+
+              {/* ===== Menu de contexto (mover marcações) ===== */}
+              {ctxMenu.show && (
+                <div
+                  style={{
+                    position: "fixed",
+                    top: ctxMenu.y,
+                    left: ctxMenu.x,
+                    zIndex: 60,
+                    background: "white",
+                    border: "1px solid #CBD5E1",
+                    borderRadius: 8,
+                    boxShadow: "0 6px 18px rgba(0,0,0,0.12)",
+                    padding: 6,
+                    minWidth: 160
+                  }}
+                  onClick={(e)=>e.stopPropagation()}
+                >
+                  <div className="text-[12px] px-2 py-1 text-slate-600">Mover marcação</div>
+                  <hr className="my-1" />
+                  <button
+                    className="w-full text-left text-[13px] px-2 py-1 hover:bg-slate-100 rounded flex items-center gap-2"
+                    onClick={()=>moveSelected("left")}
+                  >
+                    <span>⬅️</span> para a esquerda
+                  </button>
+                  <button
+                    className="w-full text-left text-[13px] px-2 py-1 hover:bg-slate-100 rounded flex items-center gap-2"
+                    onClick={()=>moveSelected("right")}
+                  >
+                    <span>➡️</span> para a direita
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Barra de rolagem horizontal (BOTTOM sticky) */}
+            <div
+              ref={bottomScrollRef}
+              onScroll={() => syncFrom("bottom")}
+              className="sticky bottom-0 mt-1.5"
+              style={{ height: 14, overflowX: "auto", overflowY: "hidden", background: "transparent" }}
+            >
+              <div style={{ width: spacerRef.current?.style?.width || 0, height: 1 }} />
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
